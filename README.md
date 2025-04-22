@@ -262,5 +262,5 @@ Resources must be tagged with:
 * Lambda execution metrics
 * CloudWatch Alarms
 * SNS delivery status
-```
+
 
