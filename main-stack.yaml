@@ -1,0 +1,76 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'StackSet for Epic Monitoring Deployment'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'Epic'
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for notifications'
+  ResourceTagKey:
+    Type: String
+    Default: 'Environment'
+    Description: 'Tag key for identifying resources'
+
+Mappings:
+  AccountEnvironment:
+    "841125194518":  # Production Account ID
+      Environment: "prod"
+      ResourceTagValue: "PROD"
+    "461605441988":  # Non-Production Account ID
+      Environment: "nonprod"
+      ResourceTagValue: "NONPROD"
+    "852325766660":  # Shared Account ID
+      Environment: "shared"
+      ResourceTagValue: "SHARED"
+    "253647676190":  # Training Account ID
+      Environment: "train"
+      ResourceTagValue: "TRAIN"
+    "227932815323":  # Read-only Account ID
+      Environment: "readonly"
+      ResourceTagValue: "READONLY"
+
+Resources:
+  FoundationMemberStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: 'https://epic-monitoring-cfn-template.s3.amazonaws.com/foundation-member.yaml'
+      Parameters:
+        Environment: !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+        ProjectName: !Ref ProjectName
+        NotificationEmail: !Ref NotificationEmail
+
+  MonitoringIAMStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: FoundationMemberStack
+    Properties:
+      TemplateURL: 'https://epic-monitoring-cfn-template.s3.amazonaws.com/monitoring-iam.yaml'
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+
+  MonitoringCoreStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: MonitoringIAMStack
+    Properties:
+      TemplateURL: 'https://epic-monitoring-cfn-template.s3.amazonaws.com/monitoring-core.yaml'
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+        MonitoringRoleArn: !GetAtt MonitoringIAMStack.Outputs.MonitoringRoleArn
+        ResourceTagKey: !Ref ResourceTagKey
+        ResourceTagValue: !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'ResourceTagValue']
+
+Outputs:
+  SNSTopicArn:
+    Description: 'ARN of the SNS Topic'
+    Value: !GetAtt FoundationMemberStack.Outputs.SNSTopicArn
+  
+  MonitoringFunctionArn:
+    Description: 'ARN of the Monitoring Lambda Function'
+    Value: !GetAtt MonitoringCoreStack.Outputs.MonitoringFunctionArn
+  
+  MonitoringRoleArn:
+    Description: 'ARN of the Monitoring Role'
+    Value: !GetAtt MonitoringIAMStack.Outputs.MonitoringRoleArn

@@ -1,0 +1,52 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IAM Roles for Epic Monitoring'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: 'Project name for resource tagging'
+    Default: 'Epic'
+  Environment:
+    Type: String
+    Description: 'Environment name'
+    AllowedValues: 
+      - prod
+      - nonprod
+      - shared
+      - train
+      - readonly
+    Default: 'prod'
+
+Resources:
+  MonitoringLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'Epic-Mon-${Environment}-${AWS::AccountId}'  # Simplified name
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: !Sub 'Epic-Mon-Policy-${Environment}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:*'
+                  - 'ec2:Describe*'
+                  - 'sns:*'
+                  - 'logs:*'
+                Resource: '*'
+
+Outputs:
+  MonitoringRoleArn:
+    Description: 'ARN of the Monitoring Lambda Role'
+    Value: !GetAtt MonitoringLambdaRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-MonRole-${Environment}'

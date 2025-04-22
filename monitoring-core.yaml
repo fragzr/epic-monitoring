@@ -1,0 +1,508 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Enhanced Core Monitoring Components for Epic Environment'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: 'Project name for resource tagging'
+    Default: 'Epic'
+  Environment:
+    Type: String
+    Description: 'Environment name (prod/nonprod/shared/train/readonly)'
+    AllowedValues: ['prod', 'nonprod', 'shared','train','readonly']
+    Default: 'prod'
+  MonitoringRoleArn:
+    Type: String
+    Description: 'ARN of the Monitoring Lambda Role'
+  ResourceTagKey:
+    Type: String
+    Description: 'Tag key to identify resources to monitor'
+    Default: 'Environment'
+  ResourceTagValue:
+    Type: String
+    Description: 'Tag value to identify resources to monitor'
+    Default: 'PROD'
+  CPUThreshold:
+    Type: Number
+    Default: 95
+    Description: 'CPU utilization threshold percentage'
+  MemoryThreshold:
+    Type: Number
+    Default: 85
+    Description: 'Memory utilization threshold percentage'
+  DiskThreshold:
+    Type: Number
+    Default: 85
+    Description: 'Disk utilization threshold percentage'
+  BurstBalanceThreshold:
+    Type: Number
+    Default: 20
+    Description: 'EBS burst balance threshold percentage'
+  NetworkThreshold:
+    Type: Number
+    Default: 80
+    Description: 'Network utilization threshold percentage'
+  IOPSThreshold:
+    Type: Number
+    Default: 5000
+    Description: 'IOPS threshold count'
+
+Resources:
+  MonitoringFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-Monitoring-${Environment}-${AWS::AccountId}'
+      Handler: index.lambda_handler
+      Role: !Ref MonitoringRoleArn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import time
+          from datetime import datetime, timezone
+
+          def cleanup_old_alarms(resources, cloudwatch):
+              """
+              Clean up old alarms for the given resources
+              """
+              try:
+                  print("Starting cleanup of old alarms...")
+                  
+                  # Get all existing alarms
+                  paginator = cloudwatch.get_paginator('describe_alarms')
+                  existing_alarms = []
+                  
+                  for page in paginator.paginate():
+                      existing_alarms.extend(page['MetricAlarms'])
+                  
+                  # Create sets of current resource IDs
+                  instance_ids = {instance['id'] for instance in resources['instances']}
+                  volume_ids = {volume['id'] for volume in resources['volumes']}
+                  
+                  # Find and delete outdated alarms
+                  for alarm in existing_alarms:
+                      alarm_name = alarm['AlarmName']
+                      
+                      # Check if alarm is related to our resources
+                      if alarm_name.startswith('Epic-'):
+                          should_delete = False
+                          
+                          # Check EC2 alarms
+                          if 'Epic-EC2-' in alarm_name:
+                              # Extract instance ID from alarm name
+                              for instance_id in instance_ids:
+                                  if instance_id in alarm_name:
+                                      break
+                              else:
+                                  should_delete = True
+                          
+                          # Check EBS alarms
+                          elif 'Epic-EBS-' in alarm_name:
+                              # Extract volume ID from alarm name
+                              for volume_id in volume_ids:
+                                  if volume_id in alarm_name:
+                                      break
+                              else:
+                                  should_delete = True
+                          
+                          if should_delete:
+                              print(f"Deleting outdated alarm: {alarm_name}")
+                              try:
+                                  cloudwatch.delete_alarms(AlarmNames=[alarm_name])
+                              except Exception as e:
+                                  print(f"Error deleting alarm {alarm_name}: {str(e)}")
+                  
+                  print("Cleanup completed")
+              
+              except Exception as e:
+                  print(f"Error in cleanup_old_alarms: {str(e)}")
+                  raise
+
+          def get_resources_by_tag(tag_key, tag_value):
+              try:
+                  print(f"Looking for resources with tag {tag_key}={tag_value}")
+                  ec2 = boto3.client('ec2')
+                  resources = {}
+                  
+                  # Get EC2 instances
+                  print("Querying EC2 instances...")
+                  instances = ec2.describe_instances(
+                      Filters=[
+                          {'Name': f'tag:{tag_key}', 'Values': [tag_value]},
+                          {'Name': 'instance-state-name', 'Values': ['running']}
+                      ]
+                  )
+                  resources['instances'] = []
+                  for reservation in instances['Reservations']:
+                      for instance in reservation['Instances']:
+                          resources['instances'].append({
+                              'id': instance['InstanceId'],
+                              'type': instance['InstanceType']
+                          })
+                  print(f"Found {len(resources['instances'])} EC2 instances")
+                  
+                  # Get EBS volumes
+                  print("Querying EBS volumes...")
+                  volumes = ec2.describe_volumes(
+                      Filters=[
+                          {'Name': f'tag:{tag_key}', 'Values': [tag_value]},
+                          {'Name': 'status', 'Values': ['in-use']}
+                      ]
+                  )
+                  resources['volumes'] = []
+                  for volume in volumes['Volumes']:
+                      resources['volumes'].append({
+                          'id': volume['VolumeId'],
+                          'type': volume['VolumeType']
+                      })
+                  print(f"Found {len(resources['volumes'])} EBS volumes")
+                  
+                  return resources
+                  
+              except Exception as e:
+                  print(f"Error in get_resources_by_tag: {str(e)}")
+                  raise
+
+          def create_ec2_alarms(instance, cloudwatch, sns_topic):
+              try:
+                  instance_id = instance['id']
+                  instance_type = instance['type']
+                  print(f"\nCreating alarms for EC2 instance {instance_id}")
+                  
+                  # CPU Utilization Alarm
+                  cloudwatch.put_metric_alarm(
+                      AlarmName=f'Epic-EC2-CPUUtilization-{instance_id}',
+                      ComparisonOperator='GreaterThanThreshold',
+                      EvaluationPeriods=6,
+                      MetricName='CPUUtilization',
+                      Namespace='AWS/EC2',
+                      Period=300,
+                      Statistic='Average',
+                      Threshold=float(os.environ['CPU_THRESHOLD']),
+                      ActionsEnabled=True,
+                      AlarmActions=[sns_topic],
+                      AlarmDescription='CPU Utilization threshold exceeded',
+                      Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}]
+                  )
+                  # Status Check Alarm
+                  cloudwatch.put_metric_alarm(
+                      AlarmName=f'Epic-EC2-StatusCheck-{instance_id}',
+                      ComparisonOperator='GreaterThanThreshold',
+                      EvaluationPeriods=3,
+                      MetricName='StatusCheckFailed',
+                      Namespace='AWS/EC2',
+                      Period=300,
+                      Statistic='Maximum',
+                      Threshold=0,
+                      ActionsEnabled=True,
+                      AlarmActions=[sns_topic],
+                      AlarmDescription='Status check failed',
+                      Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}]
+                  )
+
+                  # Network In/Out Alarm
+                  cloudwatch.put_metric_alarm(
+                      AlarmName=f'Epic-EC2-NetworkUtilization-{instance_id}',
+                      ComparisonOperator='GreaterThanThreshold',
+                      EvaluationPeriods=3,
+                      Threshold=float(os.environ['NETWORK_THRESHOLD']),
+                      ActionsEnabled=True,
+                      AlarmActions=[sns_topic],
+                      AlarmDescription='Network utilization threshold exceeded',
+                      Metrics=[
+                          {
+                              'Id': 'm1',
+                              'MetricStat': {
+                                  'Metric': {
+                                      'Namespace': 'AWS/EC2',
+                                      'MetricName': 'NetworkIn',
+                                      'Dimensions': [{'Name': 'InstanceId', 'Value': instance_id}]
+                                  },
+                                  'Period': 300,
+                                  'Stat': 'Average'
+                              },
+                              'ReturnData': False
+                          },
+                          {
+                              'Id': 'm2',
+                              'MetricStat': {
+                                  'Metric': {
+                                      'Namespace': 'AWS/EC2',
+                                      'MetricName': 'NetworkOut',
+                                      'Dimensions': [{'Name': 'InstanceId', 'Value': instance_id}]
+                                  },
+                                  'Period': 300,
+                                  'Stat': 'Average'
+                              },
+                              'ReturnData': False
+                          },
+                          {
+                              'Id': 'e1',
+                              'Expression': '(m1+m2)/1024/1024/1024*8',
+                              'Label': 'Network Gbps',
+                              'ReturnData': True
+                          }
+                      ]
+                  )
+
+                  # CPU Credit Balance Alarm (for T-type instances)
+                  if instance_type.startswith('t'):
+                      cloudwatch.put_metric_alarm(
+                          AlarmName=f'Epic-EC2-CPUCreditBalance-{instance_id}',
+                          ComparisonOperator='LessThanThreshold',
+                          EvaluationPeriods=3,
+                          MetricName='CPUCreditBalance',
+                          Namespace='AWS/EC2',
+                          Period=300,
+                          Statistic='Average',
+                          Threshold=20,
+                          ActionsEnabled=True,
+                          AlarmActions=[sns_topic],
+                          AlarmDescription='CPU Credit Balance is low',
+                          Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}]
+                      )
+
+              except Exception as e:
+                  print(f"Error creating EC2 alarms for instance {instance_id}: {str(e)}")
+                  raise
+
+          def create_ebs_alarms(volume, cloudwatch, sns_topic):
+              try:
+                  volume_id = volume['id']
+                  volume_type = volume['type']
+                  print(f"\nCreating alarms for EBS volume {volume_id}")
+                  # Volume Queue Length Alarm
+                  cloudwatch.put_metric_alarm(
+                      AlarmName=f'Epic-EBS-QueueLength-{volume_id}',
+                      ComparisonOperator='GreaterThanThreshold',
+                      EvaluationPeriods=3,
+                      MetricName='VolumeQueueLength',
+                      Namespace='AWS/EBS',
+                      Period=300,
+                      Statistic='Average',
+                      Threshold=1,
+                      ActionsEnabled=True,
+                      AlarmActions=[sns_topic],
+                      AlarmDescription='Volume queue length exceeded threshold',
+                      Dimensions=[{'Name': 'VolumeId', 'Value': volume_id}]
+                  )
+                  
+                  # Volume IOPS Monitoring
+                  cloudwatch.put_metric_alarm(
+                      AlarmName=f'Epic-EBS-IOPS-{volume_id}',
+                      ComparisonOperator='GreaterThanThreshold',
+                      EvaluationPeriods=3,
+                      Threshold=float(os.environ['IOPS_THRESHOLD']),
+                      ActionsEnabled=True,
+                      AlarmActions=[sns_topic],
+                      AlarmDescription='Volume IOPS exceeded threshold',
+                      Metrics=[
+                          {
+                              'Id': 'm1',
+                              'MetricStat': {
+                                  'Metric': {
+                                      'Namespace': 'AWS/EBS',
+                                      'MetricName': 'VolumeReadOps',
+                                      'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}]
+                                  },
+                                  'Period': 300,
+                                  'Stat': 'Sum'
+                              },
+                              'ReturnData': False
+                          },
+                          {
+                              'Id': 'm2',
+                              'MetricStat': {
+                                  'Metric': {
+                                      'Namespace': 'AWS/EBS',
+                                      'MetricName': 'VolumeWriteOps',
+                                      'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}]
+                                  },
+                                  'Period': 300,
+                                  'Stat': 'Sum'
+                              },
+                              'ReturnData': False
+                          },
+                          {
+                              'Id': 'e1',
+                              'Expression': '(m1+m2)/300',
+                              'Label': 'Total IOPS',
+                              'ReturnData': True
+                          }
+                      ]
+                  )
+
+                  # Burst Balance Alarm for gp2/gp3 volumes
+                  if volume_type in ['gp2', 'gp3']:
+                      cloudwatch.put_metric_alarm(
+                          AlarmName=f'Epic-EBS-BurstBalance-{volume_id}',
+                          ComparisonOperator='LessThanThreshold',
+                          EvaluationPeriods=3,
+                          MetricName='BurstBalance',
+                          Namespace='AWS/EBS',
+                          Period=300,
+                          Statistic='Average',
+                          Threshold=float(os.environ['BURST_BALANCE_THRESHOLD']),
+                          ActionsEnabled=True,
+                          AlarmActions=[sns_topic],
+                          AlarmDescription='Volume burst balance is low',
+                          Dimensions=[{'Name': 'VolumeId', 'Value': volume_id}]
+                      )
+
+              except Exception as e:
+                  print(f"Error creating EBS alarms for volume {volume_id}: {str(e)}")
+                  raise
+          def create_network_alarms(cloudwatch, sns_topic):
+              try:
+                  # Initialize AWS clients
+                  ec2 = boto3.client('ec2')
+                  dx = boto3.client('directconnect')
+                  
+                  print("Starting network resource discovery...")
+                  
+                  # VPN Connection Monitoring
+                  vpn_connections = ec2.describe_vpn_connections()
+                  for vpn in vpn_connections['VpnConnections']:
+                      vpn_id = vpn['VpnConnectionId']
+                      
+                      # Monitor each tunnel
+                      for tunnel in vpn['VgwTelemetry']:
+                          tunnel_ip = tunnel['OutsideIpAddress']
+                          print(f"Creating alarms for VPN tunnel {vpn_id}-{tunnel_ip}")
+                          
+                          # VPN Tunnel Status Alarm
+                          cloudwatch.put_metric_alarm(
+                              AlarmName=f'Epic-VPNTunnel-Status-{vpn_id}-{tunnel_ip}',
+                              ComparisonOperator='LessThanThreshold',
+                              EvaluationPeriods=1,
+                              MetricName='TunnelState',
+                              Namespace='AWS/VPN',
+                              Period=60,
+                              Statistic='Average',
+                              Threshold=1,
+                              ActionsEnabled=True,
+                              AlarmActions=[sns_topic],
+                              AlarmDescription='VPN tunnel is down',
+                              Dimensions=[
+                                  {'Name': 'VpnId', 'Value': vpn_id},
+                                  {'Name': 'TunnelIpAddress', 'Value': tunnel_ip}
+                              ]
+                          )
+
+              except Exception as e:
+                  print(f"Error creating network alarms: {str(e)}")
+                  raise
+
+          def lambda_handler(event, context):
+              try:
+                  print("==== Lambda Function Started ====")
+                  print(f"Event received: {json.dumps(event)}")
+                  
+                  # Initialize AWS clients
+                  cloudwatch = boto3.client('cloudwatch')
+                  ec2 = boto3.client('ec2')
+                  sns_topic = os.environ['SNS_TOPIC']
+                  
+                  print(f"Environment variables: {dict(os.environ)}")
+                  
+                  # 1. EC2 and EBS Monitoring
+                  print("\n=== Starting EC2 and EBS Resource Discovery ===")
+                  resources = get_resources_by_tag(os.environ['TAG_KEY'], os.environ['TAG_VALUE'])
+                  print(f"Retrieved EC2/EBS resources: {json.dumps(resources, default=str)}")
+                  
+                  # Cleanup old alarms before creating new ones
+                  print("\n=== Cleaning up old alarms ===")
+                  cleanup_old_alarms(resources, cloudwatch)
+                  
+                  # Create EC2 instance alarms
+                  print("\n=== Creating EC2 instance alarms ===")
+                  for instance in resources['instances']:
+                      try:
+                          print(f"Processing instance: {instance['id']}")
+                          create_ec2_alarms(instance, cloudwatch, sns_topic)
+                      except Exception as e:
+                          print(f"Error creating alarms for instance {instance['id']}: {str(e)}")
+                  
+                  # Create EBS volume alarms
+                  print("\n=== Creating EBS volume alarms ===")
+                  for volume in resources['volumes']:
+                      try:
+                          print(f"Processing volume: {volume['id']}")
+                          create_ebs_alarms(volume, cloudwatch, sns_topic)
+                      except Exception as e:
+                          print(f"Error creating alarms for volume {volume['id']}: {str(e)}")
+                  
+                  # Create network alarms
+                  print("\n=== Creating Network Resource Alarms ===")
+                  try:
+                      create_network_alarms(cloudwatch, sns_topic)
+                  except Exception as e:
+                      print(f"Error creating network alarms: {str(e)}")
+                  
+                  print("\n==== Lambda Function Completed Successfully ====")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Alarms created successfully')
+                  }
+                  
+              except Exception as e:
+                  print(f"\n==== ERROR in Lambda Function ====")
+                  print(f"Error type: {type(e)}")
+                  print(f"Error message: {str(e)}")
+                  import traceback
+                  print(f"Traceback: {traceback.format_exc()}")
+                  raise
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-Monitoring-${Environment}'
+          TAG_KEY: !Ref ResourceTagKey
+          TAG_VALUE: !Ref ResourceTagValue
+          CPU_THRESHOLD: !Ref CPUThreshold
+          MEMORY_THRESHOLD: !Ref MemoryThreshold
+          DISK_THRESHOLD: !Ref DiskThreshold
+          BURST_BALANCE_THRESHOLD: !Ref BurstBalanceThreshold
+          NETWORK_THRESHOLD: !Ref NetworkThreshold
+          IOPS_THRESHOLD: !Ref IOPSThreshold
+
+  MonitoringScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-Monitoring-Schedule-${Environment}-${AWS::AccountId}'
+      Description: 'Schedule for monitoring function'
+      ScheduleExpression: 'rate(5 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MonitoringFunction.Arn
+          Id: MonitoringSchedule
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MonitoringFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt MonitoringScheduleRule.Arn
+
+  MonitoringFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-Monitoring-${Environment}-${AWS::AccountId}'
+      RetentionInDays: 14
+
+Outputs:
+  MonitoringFunctionArn:
+    Description: 'ARN of the Monitoring Lambda Function'
+    Value: !GetAtt MonitoringFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-MonitoringFunction-${Environment}-${AWS::AccountId}'
+  
+  MonitoringScheduleRuleArn:
+    Description: 'ARN of the EventBridge Schedule Rule'
+    Value: !GetAtt MonitoringScheduleRule.Arn
+    Export:
+      Name: !Sub '${ProjectName}-MonitoringSchedule-${Environment}-${AWS::AccountId}'
+
