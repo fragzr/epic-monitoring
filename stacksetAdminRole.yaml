@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'StackSet Administrator Role in management account'
+
+Resources:
+  StackSetAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSCloudFormationStackSetAdminRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StackSetAdministration
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sts:AssumeRole'
+                Resource: 
+                  - 'arn:aws:iam::*:role/AWSCloudFormationStackSetExecutionRole'
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:CreateStack'
+                  - 'cloudformation:UpdateStack'
+                  - 'cloudformation:DeleteStack'
+                  - 'cloudformation:DescribeStacks'
+                  - 'cloudformation:ListStacks'
+                  - 'cloudformation:DescribeStackEvents'
+                  - 'cloudformation:DetectStackDrift'
+                  - 'cloudformation:DetectStackResourceDrift'
+                  - 'cloudformation:DescribeStackDrift'
+                  - 'cloudformation:DescribeStackResourceDrifts'
+                  - 'cloudformation:DescribeStackSetOperation'
+                  - 'cloudformation:CreateStackSet'
+                  - 'cloudformation:UpdateStackSet'
+                  - 'cloudformation:DeleteStackSet'
+                  - 'cloudformation:ListStackSets'
+                  - 'cloudformation:DescribeStackSet'
+                  - 'cloudformation:ListStackInstances'
+                  - 'cloudformation:CreateStackInstances'
+                  - 'cloudformation:DeleteStackInstances'
+                  - 'cloudformation:UpdateStackInstances'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'organizations:ListAccounts'
+                  - 'organizations:DescribeAccount'
+                  - 'organizations:DescribeOrganization'
+                  - 'organizations:ListRoots'
+                  - 'organizations:ListOrganizationalUnitsForParent'
+                  - 'organizations:ListAccountsForParent'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                  - 'ssm:DescribeParameters'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'iam:GetRole'
+                  - 'iam:GetRolePolicy'
+                  - 'iam:ListRoles'
+                  - 'iam:ListRolePolicies'
+                Resource: '*'
+
+Outputs:
+  StackSetAdminRoleArn:
+    Description: 'StackSet Administrator Role ARN'
+    Value: !GetAtt StackSetAdminRole.Arn

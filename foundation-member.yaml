@@ -4,9 +4,8 @@ Description: 'Foundation layer for Epic monitoring - Member Account Deployment'
 Parameters:
   Environment:
     Type: String
-    Description: 'Environment name (prod/nonprod/shared/train/readonly)'
-    AllowedValues: ['prod', 'nonprod', 'shared','train','readonly']
-    Default: 'prod'
+    Description: 'Environment name (PROD/NONPROD/SHARED/TRAIN/READONLY)'
+    Default: 'PROD'
   ProjectName:
     Type: String
     Description: 'Project name for resource tagging'

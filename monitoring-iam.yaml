@@ -8,20 +8,14 @@ Parameters:
     Default: 'Epic'
   Environment:
     Type: String
-    Description: 'Environment name'
-    AllowedValues: 
-      - prod
-      - nonprod
-      - shared
-      - train
-      - readonly
-    Default: 'prod'
+    Description: 'Environment name (PROD/NONPROD/SHARED/TRAIN/READONLY)'
+    Default: 'PROD'
 
 Resources:
   MonitoringLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub 'Epic-Mon-${Environment}-${AWS::AccountId}'
+      Path: '/epic/monitoring/'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -92,6 +86,13 @@ Resources:
                 Action:
                   - 'sns:Publish'
                 Resource: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-Monitoring-${Environment}'
+      Tags:
+        - Key: Name
+          Value: !Sub 'Epic-Mon-${Environment}-${AWS::AccountId}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
 
 Outputs:
   MonitoringRoleArn:

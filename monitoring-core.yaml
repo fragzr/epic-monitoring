@@ -74,8 +74,7 @@ Parameters:
   Environment:
     Type: String
     Description: 'Environment name'
-    AllowedValues: ['prod', 'nonprod', 'shared', 'train', 'readonly']
-    Default: 'prod'
+    Default: 'PROD'
 
   # EC2 Tag Configurations
   EC2TagPairs:
@@ -189,1032 +188,1271 @@ Resources:
       Role: !GetAtt MonitoringLambdaRole.Arn  
       Code:
         ZipFile: |
-          import boto3
-          import os
-          import json
-          from datetime import datetime, timezone
+            import boto3
+            import os
+            import json
+            from datetime import datetime, timezone
 
-          def parse_tag_pairs(tag_pairs_json):
-              """
-              Parse JSON string of tag key-value pairs
-              """
-              try:
-                  tag_pairs = json.loads(tag_pairs_json)
-                  if not isinstance(tag_pairs, list):
-                      raise ValueError("Tag pairs must be a list")
-                  
-                  # Validate each pair has a key
-                  for pair in tag_pairs:
-                      if 'key' not in pair:
-                          raise ValueError("Each tag pair must have a 'key'")
-                  
-                  return tag_pairs
-              except json.JSONDecodeError as e:
-                  print(f"Error parsing tag pairs JSON: {str(e)}")
-                  raise
-              except ValueError as e:
-                  print(f"Invalid tag pairs format: {str(e)}")
-                  raise
+            def should_discover_all_resources(tag_pairs_json):
+                """
+                Check if we should discover all resources (no tags defined)
+                """
+                if not tag_pairs_json or tag_pairs_json.isspace():
+                    return True
+                try:
+                    tag_pairs = json.loads(tag_pairs_json)
+                    return not tag_pairs or tag_pairs == [{"key":"Environment","value":""}]
+                except:
+                    return False
 
-          def get_resources_by_tag_pairs(tag_pairs):
-              """
-              Convert tag pairs into AWS filter format
-              """
-              filters = []
-              for pair in tag_pairs:
-                  if pair.get('value'):
-                      values = [v.strip() for v in pair['value'].split(',')]
-                      filters.append({'Name': f'tag:{pair["key"]}', 'Values': values})
-                  else:
-                      filters.append({'Name': 'tag-key', 'Values': [pair['key']]})
-              return filters
+            def parse_tag_pairs(tag_pairs_json):
+                """
+                Parse JSON string of tag key-value pairs
+                - Case insensitive for property names (key/Key, value/Value)
+                - Case sensitive for actual tag keys and values
+                """
+                print(f"Parsing tag pairs: {tag_pairs_json}")
+                if not tag_pairs_json or tag_pairs_json.isspace():
+                    print("No tags defined, will discover all resources")
+                    return None
+                    
+                try:
+                    tag_pairs = json.loads(tag_pairs_json)
+                    if not isinstance(tag_pairs, list):
+                        raise ValueError("Tag pairs must be a list")
+                        
+                    # Check if it's the default empty configuration
+                    if tag_pairs == [{"key":"Environment","value":""}] or \
+                    tag_pairs == [{"Key":"Environment","Value":""}]:
+                        print("Default empty tag configuration, will discover all resources")
+                        return None
+                    
+                    normalized_tag_pairs = []
+                    for pair in tag_pairs:
+                        # Convert all keys to lowercase for comparison
+                        lower_keys = {k.lower(): k for k in pair.keys()}
+                        
+                        normalized_pair = {}
+                        # Look for any variation of 'key' (key, Key, KEY, etc.)
+                        if 'key' in lower_keys:
+                            # Preserve the actual tag key value's case
+                            normalized_pair['Key'] = pair[lower_keys['key']]
+                        else:
+                            raise ValueError("Each tag pair must have a 'key' field (case insensitive)")
+                        
+                        # Look for any variation of 'value' (value, Value, VALUE, etc.)
+                        if 'value' in lower_keys:
+                            # Preserve the actual tag value's case
+                            normalized_pair['Value'] = pair[lower_keys['value']]
+                        else:
+                            normalized_pair['Value'] = ''
+                        
+                        normalized_tag_pairs.append(normalized_pair)
+                    
+                    print(f"Parsed tag pairs: {normalized_tag_pairs}")
+                    return normalized_tag_pairs
+                    
+                except json.JSONDecodeError as e:
+                    print(f"Error parsing tag pairs JSON: {str(e)}")
+                    raise
+                except ValueError as e:
+                    print(f"Invalid tag pairs format: {str(e)}")
+                    raise
 
-          def get_environment_threshold(prod, nonprod, shared, train, readonly):
-              """
-              Get threshold value based on environment
-              """
-              env = os.environ['ENVIRONMENT']
-              if env == 'prod':
-                  return prod
-              elif env == 'nonprod':
-                  return nonprod
-              elif env == 'shared':
-                  return shared
-              elif env == 'train':
-                  return train
-              return readonly
-
-          def create_alarm(cloudwatch, alarm_config):
-              """
-              Create or update CloudWatch alarm
-              """
-              try:
-                  print(f"Creating alarm: {alarm_config['AlarmName']}")
-                  cloudwatch.put_metric_alarm(**alarm_config)
-              except Exception as e:
-                  print(f"Error creating alarm {alarm_config['AlarmName']}: {str(e)}")
-
-          def get_ec2_instances(ec2_client, tag_pairs_json):
-              """
-              Get EC2 instances based on tag pairs
-              """
-              tag_pairs = parse_tag_pairs(tag_pairs_json)
-              filters = get_resources_by_tag_pairs(tag_pairs)
-              filters.append({'Name': 'instance-state-name', 'Values': ['running']})
-              
-              instances = []
-              paginator = ec2_client.get_paginator('describe_instances')
-              
-              for page in paginator.paginate(Filters=filters):
-                  for reservation in page['Reservations']:
-                      instances.extend(reservation['Instances'])
-              
-              return instances
-
-          def get_ebs_volumes(ec2_client, tag_pairs_json):
-              """
-              Get EBS volumes based on tag pairs
-              """
-              tag_pairs = parse_tag_pairs(tag_pairs_json)
-              filters = get_resources_by_tag_pairs(tag_pairs)
-              filters.append({'Name': 'status', 'Values': ['in-use']})
-              
-              volumes = []
-              paginator = ec2_client.get_paginator('describe_volumes')
-              
-              for page in paginator.paginate(Filters=filters):
-                  volumes.extend(page['Volumes'])
-              
-              return volumes
-
-          def get_load_balancers(elbv2_client, tag_pairs_json, lb_type):
-              """
-              Get Load Balancers based on tag pairs and type (application or network)
-              """
-              tag_pairs = parse_tag_pairs(tag_pairs_json)
-              load_balancers = []
-              paginator = elbv2_client.get_paginator('describe_load_balancers')
-              
-              for page in paginator.paginate():
-                  for lb in page['LoadBalancers']:
-                      if lb['Type'] != lb_type:
-                          continue
-                          
-                      tags = elbv2_client.describe_tags(
-                          ResourceArns=[lb['LoadBalancerArn']])['TagDescriptions'][0]['Tags']
-                      
-                      matches_all_pairs = True
-                      for pair in tag_pairs:
-                          key_match = False
-                          for tag in tags:
-                              if tag['Key'] == pair['key']:
-                                  key_match = True
-                                  if pair.get('value'):
-                                      if tag['Value'] not in pair['value'].split(','):
-                                          matches_all_pairs = False
-                                          break
-                          if not key_match:
-                              matches_all_pairs = False
-                              break
-                      
-                      if matches_all_pairs:
-                          load_balancers.append(lb)
-              
-              return load_balancers
-
-          def get_vpn_connections(ec2_client, tag_pairs_json):
-              """
-              Get VPN connections based on tag pairs
-              """
-              tag_pairs = parse_tag_pairs(tag_pairs_json)
-              filters = get_resources_by_tag_pairs(tag_pairs)
-              return ec2_client.describe_vpn_connections(Filters=filters)['VpnConnections']
-
-          def get_direct_connect_connections(dx_client, tag_pairs_json):
-              """
-              Get Direct Connect connections based on tag pairs
-              """
-              tag_pairs = parse_tag_pairs(tag_pairs_json)
-              connections = dx_client.describe_connections()['connections']
-              filtered_connections = []
-              
-              for conn in connections:
-                  if 'resourceTags' in conn:  # Some connections might not have tags
-                      matches_all_pairs = True
-                      for pair in tag_pairs:
-                          key_match = False
-                          for tag in conn['resourceTags']:
-                              if tag['key'] == pair['key']:
-                                  key_match = True
-                                  if pair.get('value'):
-                                      if tag['value'] not in pair['value'].split(','):
-                                          matches_all_pairs = False
-                                          break
-                          if not key_match:
-                              matches_all_pairs = False
-                              break
-                      
-                      if matches_all_pairs:
-                          filtered_connections.append(conn)
-              
-              return filtered_connections
-
-          def get_transit_gateways(ec2_client, tag_pairs_json):
-              """
-              Get Transit Gateways based on tag pairs
-              """
-              tag_pairs = parse_tag_pairs(tag_pairs_json)
-              filters = get_resources_by_tag_pairs(tag_pairs)
-              return ec2_client.describe_transit_gateways(Filters=filters)['TransitGateways']
-
-          def get_waf_acls(wafv2_client, tag_pairs_json):
-              """
-              Get WAF ACLs based on tag pairs
-              """
-              tag_pairs = parse_tag_pairs(tag_pairs_json)
-              web_acls = []
-              
-              for scope in ['REGIONAL', 'CLOUDFRONT']:
-                  try:
-                      response = wafv2_client.list_web_acls(Scope=scope)
-                      for acl in response['WebACLs']:
-                          tags = wafv2_client.list_tags_for_resource(
-                              ResourceARN=acl['ARN'])['TagList']
-                          
-                          matches_all_pairs = True
-                          for pair in tag_pairs:
-                              key_match = False
-                              for tag in tags:
-                                  if tag['Key'] == pair['key']:
-                                      key_match = True
-                                      if pair.get('value'):
-                                          if tag['Value'] not in pair['value'].split(','):
-                                              matches_all_pairs = False
-                                              break
-                              if not key_match:
-                                  matches_all_pairs = False
-                                  break
-                          
-                          if matches_all_pairs:
-                              web_acls.append(acl)
-                  except Exception as e:
-                      print(f"Error getting WAF ACLs for scope {scope}: {str(e)}")
-              
-              return web_acls
-
-          def get_network_firewalls(nfw_client, tag_pairs_json):
-              """
-              Get Network Firewalls based on tag pairs
-              """
-              tag_pairs = parse_tag_pairs(tag_pairs_json)
-              firewalls = []
-              
-              try:
-                  response = nfw_client.list_firewalls()
-                  for fw in response['Firewalls']:
-                      tags = nfw_client.list_tags_for_resource(
-                          ResourceArn=fw['FirewallArn'])['TagList']
-                      
-                      matches_all_pairs = True
-                      for pair in tag_pairs:
-                          key_match = False
-                          for tag in tags:
-                              if tag['Key'] == pair['key']:
-                                  key_match = True
-                                  if pair.get('value'):
-                                      if tag['Value'] not in pair['value'].split(','):
-                                          matches_all_pairs = False
-                                          break
-                          if not key_match:
-                              matches_all_pairs = False
-                              break
-                      
-                      if matches_all_pairs:
-                          firewalls.append(fw)
-              except Exception as e:
-                  print(f"Error getting Network Firewalls: {str(e)}")
-              
-              return firewalls
-
-          def get_rds_instances(rds_client, tag_pairs_json):
-              """
-              Get RDS instances based on tag pairs
-              """
-              tag_pairs = parse_tag_pairs(tag_pairs_json)
-              instances = []
-              
-              paginator = rds_client.get_paginator('describe_db_instances')
-              for page in paginator.paginate():
-                  for instance in page['DBInstances']:
-                      tags = rds_client.list_tags_for_resource(
-                          ResourceName=instance['DBInstanceArn'])['TagList']
-                      
-                      matches_all_pairs = True
-                      for pair in tag_pairs:
-                          key_match = False
-                          for tag in tags:
-                              if tag['Key'] == pair['key']:
-                                  key_match = True
-                                  if pair.get('value'):
-                                      if tag['Value'] not in pair['value'].split(','):
-                                          matches_all_pairs = False
-                                          break
-                          if not key_match:
-                              matches_all_pairs = False
-                              break
-                      
-                      if matches_all_pairs:
-                          instances.append(instance)
-              
-              return instances
-
-          def get_fsx_filesystems(fsx_client, tag_pairs_json, filesystem_type):
-              """
-              Get FSx filesystems based on tag pairs and type
-              """
-              tag_pairs = parse_tag_pairs(tag_pairs_json)
-              filesystems = []
-              
-              try:
-                  paginator = fsx_client.get_paginator('describe_file_systems')
-                  for page in paginator.paginate():
-                      for fs in page['FileSystems']:
-                          if fs['FileSystemType'] != filesystem_type:
-                              continue
-                          
-                          matches_all_pairs = True
-                          for pair in tag_pairs:
-                              key_match = False
-                              for tag in fs.get('Tags', []):
-                                  if tag['Key'] == pair['key']:
-                                      key_match = True
-                                      if pair.get('value'):
-                                          if tag['Value'] not in pair['value'].split(','):
-                                              matches_all_pairs = False
-                                              break
-                              if not key_match:
-                                  matches_all_pairs = False
-                                  break
-                          
-                          if matches_all_pairs:
-                              filesystems.append(fs)
-              except Exception as e:
-                  print(f"Error getting FSx filesystems: {str(e)}")
-              
-              return filesystems
-
-          def create_ec2_alarms(instance_id, cloudwatch, sns_topic):
-              """
-              Create EC2 instance alarms
-              """
-              # CPU Utilization
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-EC2-CPUUtilization-{instance_id}',
-                  'MetricName': 'CPUUtilization',
-                  'Namespace': 'AWS/EC2',
-                  'Statistic': 'Average',
-                  'Dimensions': [{'Name': 'InstanceId', 'Value': instance_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(80, 85, 85, 90, 90),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'missing',
-                  'Unit': 'Percent'
-              })
-
-              # Memory Utilization (requires CW Agent)
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-EC2-MemoryUtilization-{instance_id}',
-                  'MetricName': 'Memory % Committed Bytes In Use',
-                  'Namespace': 'CWAgent',
-                  'Statistic': 'Average',
-                  'Dimensions': [{'Name': 'InstanceId', 'Value': instance_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(80, 85, 85, 90, 90),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'missing',
-                  'Unit': 'Percent'
-              })
-
-              # Status Check
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-EC2-StatusCheck-{instance_id}',
-                  'MetricName': 'StatusCheckFailed',
-                  'Namespace': 'AWS/EC2',
-                  'Statistic': 'Maximum',
-                  'Dimensions': [{'Name': 'InstanceId', 'Value': instance_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': 1,
-                  'ComparisonOperator': 'GreaterThanOrEqualToThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'breaching',
-                  'Unit': 'Count'
-              })
-
-              # Credit Balance (for T-type instances)
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-EC2-CreditBalance-{instance_id}',
-                  'MetricName': 'CPUCreditBalance',
-                  'Namespace': 'AWS/EC2',
-                  'Statistic': 'Average',
-                  'Dimensions': [{'Name': 'InstanceId', 'Value': instance_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': 20,
-                  'ComparisonOperator': 'LessThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'missing',
-                  'Unit': 'Count'
-              })
-
-          def create_ebs_alarms(volume_id, volume_type, cloudwatch, sns_topic):
-              """
-              Create EBS volume alarms
-              """
-              # Space Utilization
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-EBS-SpaceUtilization-{volume_id}',
-                  'MetricName': 'VolumeUsedPercent',
-                  'Namespace': 'AWS/EBS',
-                  'Statistic': 'Average',
-                  'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(75, 80, 80, 85, 85),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'missing',
-                  'Unit': 'Percent'
-              })
-
-              # IOPS
-              iops_threshold = 10000 if volume_type == 'io2' else 3000
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-EBS-IOPS-{volume_id}',
-                  'MetricName': 'VolumeReadOps',
-                  'Namespace': 'AWS/EBS',
-                  'Statistic': 'Sum',
-                  'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': iops_threshold,
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Count/Second'
-              })
-
-              # Queue Length
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-EBS-QueueLength-{volume_id}',
-                  'MetricName': 'VolumeQueueLength',
-                  'Namespace': 'AWS/EBS',
-                  'Statistic': 'Average',
-                  'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': 1,
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Count'
-              })
-
-              # Burst Balance (for gp2/gp3)
-              if volume_type in ['gp2', 'gp3']:
-                  create_alarm(cloudwatch, {
-                      'AlarmName': f'Epic-EBS-BurstBalance-{volume_id}',
-                      'MetricName': 'BurstBalance',
-                      'Namespace': 'AWS/EBS',
-                      'Statistic': 'Average',
-                      'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}],
-                      'Period': 300,
-                      'EvaluationPeriods': 2,
-                      'Threshold': 20,
-                      'ComparisonOperator': 'LessThanThreshold',
-                      'AlarmActions': [sns_topic],
-                      'TreatMissingData': 'missing',
-                      'Unit': 'Percent'
-                  })
-
-          def create_alb_alarms(alb_arn, cloudwatch, sns_topic):
-              """
-              Create Application Load Balancer alarms
-              """
-              alb_name = alb_arn.split('/')[-1]
-              
-              # Active Connections
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-ALB-ActiveConnections-{alb_name}',
-                  'MetricName': 'ActiveConnectionCount',
-                  'Namespace': 'AWS/ApplicationELB',
-                  'Statistic': 'Sum',
-                  'Dimensions': [{'Name': 'LoadBalancer', 'Value': alb_arn}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(5000, 2000, 2000, 1000, 1000),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Count'
-              })
-
-              # 5XX Errors
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-ALB-5XXErrors-{alb_name}',
-                  'MetricName': 'HTTPCode_ELB_5XX_Count',
-                  'Namespace': 'AWS/ApplicationELB',
-                  'Statistic': 'Sum',
-                  'Dimensions': [{'Name': 'LoadBalancer', 'Value': alb_arn}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(10, 20, 20, 50, 50),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Count'
-              })
-
-              # Response Time
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-ALB-ResponseTime-{alb_name}',
-                  'MetricName': 'TargetResponseTime',
-                  'Namespace': 'AWS/ApplicationELB',
-                  'Statistic': 'Average',
-                  'Dimensions': [{'Name': 'LoadBalancer', 'Value': alb_arn}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(1, 2, 2, 5, 5),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Seconds'
-              })
-
-          def create_nlb_alarms(nlb_arn, cloudwatch, sns_topic):
-              """
-              Create Network Load Balancer alarms
-              """
-              nlb_name = nlb_arn.split('/')[-1]
-              
-              # Active Connections
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-NLB-ActiveConnections-{nlb_name}',
-                  'MetricName': 'ActiveFlowCount',
-                  'Namespace': 'AWS/NetworkELB',
-                  'Statistic': 'Sum',
-                  'Dimensions': [{'Name': 'LoadBalancer', 'Value': nlb_arn}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(5000, 2000, 2000, 1000, 1000),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Count'
-              })
-
-              # TCP Reset Count
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-NLB-TCPResetCount-{nlb_name}',
-                  'MetricName': 'TCP_Reset_Count',
-                  'Namespace': 'AWS/NetworkELB',
-                  'Statistic': 'Sum',
-                  'Dimensions': [{'Name': 'LoadBalancer', 'Value': nlb_arn}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(100, 200, 200, 500, 500),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Count'
-              })
-
-          def create_vpn_alarms(vpn_id, tunnel_address, cloudwatch, sns_topic):
-              """
-              Create VPN connection alarms
-              """
-              # Tunnel Status
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-VPN-TunnelStatus-{vpn_id}-{tunnel_address}',
-                  'MetricName': 'TunnelState',
-                  'Namespace': 'AWS/VPN',
-                  'Statistic': 'Minimum',
-                  'Dimensions': [
-                      {'Name': 'VpnId', 'Value': vpn_id},
-                      {'Name': 'TunnelIpAddress', 'Value': tunnel_address}
-                  ],
-                  'Period': 300,
-                  'EvaluationPeriods': 1,
-                  'Threshold': 0,
-                  'ComparisonOperator': 'LessThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'breaching',
-                  'Unit': 'None'
-              })
-
-              # Bytes In
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-VPN-BytesIn-{vpn_id}-{tunnel_address}',
-                  'MetricName': 'TunnelDataIn',
-                  'Namespace': 'AWS/VPN',
-                  'Statistic': 'Average',
-                  'Dimensions': [
-                      {'Name': 'VpnId', 'Value': vpn_id},
-                      {'Name': 'TunnelIpAddress', 'Value': tunnel_address}
-                  ],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(100000000, 100000000, 100000000, 100000000, 100000000),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Bytes'
-              })
-
-          def create_direct_connect_alarms(connection_id, cloudwatch, sns_topic):
-              """
-              Create Direct Connect alarms
-              """
-              # Connection Status
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-DirectConnect-ConnectionStatus-{connection_id}',
-                  'MetricName': 'ConnectionState',
-                  'Namespace': 'AWS/DX',
-                  'Statistic': 'Minimum',
-                  'Dimensions': [{'Name': 'ConnectionId', 'Value': connection_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 1,
-                  'Threshold': 0,
-                  'ComparisonOperator': 'LessThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'breaching',
-                  'Unit': 'None'
-              })
-
-              # Bandwidth Utilization
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-DirectConnect-BandwidthUtilization-{connection_id}',
-                  'MetricName': 'ConnectionBpsEgress',
-                  'Namespace': 'AWS/DX',
-                  'Statistic': 'Average',
-                  'Dimensions': [{'Name': 'ConnectionId', 'Value': connection_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(80, 85, 85, 90, 90),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Percent'
-              })
-
-          def create_transit_gateway_alarms(tgw_id, cloudwatch, sns_topic):
-              """
-              Create Transit Gateway alarms
-              """
-              # Bytes Dropped
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-TransitGateway-BytesDropped-{tgw_id}',
-                  'MetricName': 'BytesDropCountBlackhole',
-                  'Namespace': 'AWS/TransitGateway',
-                  'Statistic': 'Sum',
-                  'Dimensions': [{'Name': 'TransitGateway', 'Value': tgw_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': 1000,
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Bytes'
-              })
-
-              # Packet Drop Count
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-TransitGateway-PacketDropCount-{tgw_id}',
-                  'MetricName': 'PacketDropCountBlackhole',
-                  'Namespace': 'AWS/TransitGateway',
-                  'Statistic': 'Sum',
-                  'Dimensions': [{'Name': 'TransitGateway', 'Value': tgw_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': 1000,
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Count'
-              })
-
-          def create_waf_alarms(web_acl_id, cloudwatch, sns_topic):
-              """
-              Create WAF alarms
-              """
-              # Blocked Requests
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-WAF-BlockedRequests-{web_acl_id}',
-                  'MetricName': 'BlockedRequests',
-                  'Namespace': 'AWS/WAFV2',
-                  'Statistic': 'Sum',
-                  'Dimensions': [{'Name': 'WebACL', 'Value': web_acl_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(1000, 2000, 2000, 5000, 5000),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Count'
-              })
-
-              # Allowed Requests Rate
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-WAF-AllowedRequestsRate-{web_acl_id}',
-                  'MetricName': 'AllowedRequests',
-                  'Namespace': 'AWS/WAFV2',
-                  'Statistic': 'Average',
-                  'Dimensions': [{'Name': 'WebACL', 'Value': web_acl_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(10000, 20000, 20000, 50000, 50000),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Count'
-              })
-
-          def create_network_firewall_alarms(firewall_name, cloudwatch, sns_topic):
-              """
-              Create Network Firewall alarms
-              """
-              # Drop Packets
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-NetworkFirewall-DroppedPackets-{firewall_name}',
-                  'MetricName': 'DroppedPackets',
-                  'Namespace': 'AWS/NetworkFirewall',
-                  'Statistic': 'Sum',
-                  'Dimensions': [{'Name': 'FirewallName', 'Value': firewall_name}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(1000, 2000, 2000, 5000, 5000),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Count'
-              })
-
-              # Alert Count
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-NetworkFirewall-AlertCount-{firewall_name}',
-                  'MetricName': 'AlertCount',
-                  'Namespace': 'AWS/NetworkFirewall',
-                  'Statistic': 'Sum',
-                  'Dimensions': [{'Name': 'FirewallName', 'Value': firewall_name}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(100, 200, 200, 500, 500),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Count'
-              })
-
-          def create_rds_alarms(instance_id, cloudwatch, sns_topic):
-              """
-              Create RDS alarms
-              """
-              # CPU Utilization
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-RDS-CPUUtilization-{instance_id}',
-                  'MetricName': 'CPUUtilization',
-                  'Namespace': 'AWS/RDS',
-                  'Statistic': 'Maximum',
-                  'Dimensions': [{'Name': 'DBInstanceIdentifier', 'Value': instance_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 5,
-                  'Threshold': get_environment_threshold(80, 85, 85, 90, 90),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'missing',
-                  'Unit': 'Percent'
-              })
-
-              # Freeable Memory
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-RDS-FreeableMemory-{instance_id}',
-                  'MetricName': 'FreeableMemory',
-                  'Namespace': 'AWS/RDS',
-                  'Statistic': 'Minimum',
-                  'Dimensions': [{'Name': 'DBInstanceIdentifier', 'Value': instance_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 5,
-                  'Threshold': 2048,
-                  'ComparisonOperator': 'LessThanOrEqualToThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'missing',
-                  'Unit': 'Megabytes'
-              })
-
-              # Read Latency
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-RDS-ReadLatency-{instance_id}',
-                  'MetricName': 'ReadLatency',
-                  'Namespace': 'AWS/RDS',
-                  'Statistic': 'Average',
-                  'Dimensions': [{'Name': 'DBInstanceIdentifier', 'Value': instance_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 3,
-                  'Threshold': 0.02,  # 20 milliseconds
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'missing',
-                  'Unit': 'Seconds'
-              })
-
-              # Write Latency
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-RDS-WriteLatency-{instance_id}',
-                  'MetricName': 'WriteLatency',
-                  'Namespace': 'AWS/RDS',
-                  'Statistic': 'Average',
-                  'Dimensions': [{'Name': 'DBInstanceIdentifier', 'Value': instance_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 3,
-                  'Threshold': 0.02,  # 20 milliseconds
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'missing',
-                  'Unit': 'Seconds'
-              })
-
-          def create_fsx_alarms(file_system_id, cloudwatch, sns_topic, filesystem_type):
-              """
-              Create FSx alarms
-              """
-              # Storage Capacity Utilization
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-FSx-{filesystem_type}-StorageCapacityUtilization-{file_system_id}',
-                  'MetricName': 'StorageCapacityUtilization',
-                  'Namespace': 'AWS/FSx',
-                  'Statistic': 'Average',
-                  'Dimensions': [{'Name': 'FileSystemId', 'Value': file_system_id}],
-                  'Period': 900,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(80, 85, 85, 90, 90),
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'missing',
-                  'Unit': 'Percent'
-              })
-
-              # Free Storage Capacity
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-FSx-{filesystem_type}-FreeStorageCapacity-{file_system_id}',
-                  'MetricName': 'FreeStorageCapacity',
-                  'Namespace': 'AWS/FSx',
-                  'Statistic': 'Average',
-                  'Dimensions': [{'Name': 'FileSystemId', 'Value': file_system_id}],
-                  'Period': 900,
-                  'EvaluationPeriods': 2,
-                  'Threshold': 10,
-                  'ComparisonOperator': 'LessThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'missing',
-                  'Unit': 'Gigabytes'
-              })
-
-              if filesystem_type == 'ONTAP':  # Additional metrics for FSx for NetApp ONTAP
-                  # Network Throughput
-                  create_alarm(cloudwatch, {
-                      'AlarmName': f'Epic-FSx-ONTAP-NetworkThroughput-{file_system_id}',
-                      'MetricName': 'NetworkThroughputUtilization',
-                      'Namespace': 'AWS/FSx',
-                      'Statistic': 'Average',
-                      'Dimensions': [{'Name': 'FileSystemId', 'Value': file_system_id}],
-                      'Period': 300,
-                      'EvaluationPeriods': 2,
-                      'Threshold': get_environment_threshold(80, 85, 85, 90, 90),
-                      'ComparisonOperator': 'GreaterThanThreshold',
-                      'AlarmActions': [sns_topic],
-                      'TreatMissingData': 'missing',
-                      'Unit': 'Percent'
-                  })
-
-          def lambda_handler(event, context):
-              """
-              Main Lambda function handler
-              """
-              try:
-                  print("Starting Epic Monitoring Lambda function...")
-                  
-                  # Initialize AWS clients
-                  cloudwatch = boto3.client('cloudwatch')
-                  ec2 = boto3.client('ec2')
-                  elbv2 = boto3.client('elbv2')
-                  rds = boto3.client('rds')
-                  dx = boto3.client('directconnect')
-                  wafv2 = boto3.client('wafv2')
-                  networkfirewall = boto3.client('network-firewall')
-                  fsx = boto3.client('fsx')
-                  
-                  sns_topic = os.environ['SNS_TOPIC']
-                  
-                  processed_resources = {
-                      'ec2': 0,
-                      'ebs': 0,
-                      'alb': 0,
-                      'nlb': 0,
-                      'vpn': 0,
-                      'dx': 0,
-                      'tgw': 0,
-                      'waf': 0,
-                      'nfw': 0,
-                      'rds': 0,
-                      'fsx_windows': 0,
-                      'fsx_netapp': 0
-                  }
-
-                  # Process EC2 Instances
-                  print("\nProcessing EC2 instances...")
-                  try:
-                      instances = get_ec2_instances(ec2, os.environ['EC2_TAG_PAIRS'])
-                      for instance in instances:
-                          create_ec2_alarms(instance['InstanceId'], cloudwatch, sns_topic)
-                          processed_resources['ec2'] += 1
+            def get_resources_by_tag_pairs(tag_pairs):
+                """
+                Convert tag pairs into AWS filter format
+                """
+                print("\nCreating AWS filters from tag pairs:")
+                print(f"Input tag pairs: {tag_pairs}")
                 
-                  except Exception as e:
-                      print(f"Error processing EC2 instances: {str(e)}")
+                if tag_pairs is None:
+                    print("No tag pairs provided - returning empty filters")
+                    return []
+                    
+                filters = []
+                for pair in tag_pairs:
+                    if pair['Value']:
+                        values = [v.strip() for v in pair['Value'].split(',')]
+                        filter_item = {'Name': f'tag:{pair["Key"]}', 'Values': values}
+                        filters.append(filter_item)
+                        print(f"Added value filter: {filter_item}")
+                    else:
+                        filter_item = {'Name': 'tag-key', 'Values': [pair['Key']]}
+                        filters.append(filter_item)
+                        print(f"Added key-only filter: {filter_item}")
+                
+                print(f"Final filters: {filters}")
+                return filters
 
-                  # Process EBS Volumes
-                  print("\nProcessing EBS volumes...")
-                  try:
-                      volumes = get_ebs_volumes(ec2, os.environ['EBS_TAG_PAIRS'])
-                      for volume in volumes:
-                          create_ebs_alarms(volume['VolumeId'], volume['VolumeType'], cloudwatch, sns_topic)
-                          processed_resources['ebs'] += 1
-                  except Exception as e:
-                      print(f"Error processing EBS volumes: {str(e)}")
 
-                  # Process Application Load Balancers
-                  print("\nProcessing Application Load Balancers...")
-                  try:
-                      albs = get_load_balancers(elbv2, os.environ['ALB_TAG_PAIRS'], 'application')
-                      for alb in albs:
-                          create_alb_alarms(alb['LoadBalancerArn'], cloudwatch, sns_topic)
-                          processed_resources['alb'] += 1
-                  except Exception as e:
-                      print(f"Error processing ALBs: {str(e)}")
+            def tags_match_all_criteria(resource_tags, required_tags):
+                """
+                Check if resource tags match all required tags
+                """
+                print("\nPerforming tag match check:")
+                print(f"Resource tags: {resource_tags}")
+                print(f"Required tags: {required_tags}")
+                
+                # If no required tags defined, match all resources
+                if required_tags is None:
+                    print("No tag requirements defined - resource matches by default")
+                    return True
+                    
+                # Convert resource tags to dictionary for easier lookup
+                resource_tag_dict = {tag['Key']: tag['Value'] for tag in resource_tags or []}
+                print(f"Resource tags as dict: {resource_tag_dict}")
+                
+                # Check each required tag
+                for required_tag in required_tags:
+                    print(f"\nChecking required tag: {required_tag}")
+                    
+                    # If tag key doesn't exist in resource tags
+                    if required_tag['Key'] not in resource_tag_dict:
+                        print(f"✗ Required tag '{required_tag['Key']}' not found in resource tags")
+                        return False
+                        
+                    # If value is specified and doesn't match
+                    if required_tag['Value']:
+                        allowed_values = [v.strip() for v in required_tag['Value'].split(',')]
+                        print(f"Checking if value '{resource_tag_dict[required_tag['Key']]}' is in allowed values: {allowed_values}")
+                        if resource_tag_dict[required_tag['Key']] not in allowed_values:
+                            print(f"✗ Tag value '{resource_tag_dict[required_tag['Key']]}' not in allowed values")
+                            return False
+                
+                print("✓ All required tags match")
+                return True
 
-                  # Process Network Load Balancers
-                  print("\nProcessing Network Load Balancers...")
-                  try:
-                      nlbs = get_load_balancers(elbv2, os.environ['NLB_TAG_PAIRS'], 'network')
-                      for nlb in nlbs:
-                          create_nlb_alarms(nlb['LoadBalancerArn'], cloudwatch, sns_topic)
-                          processed_resources['nlb'] += 1
-                  except Exception as e:
-                      print(f"Error processing NLBs: {str(e)}")
 
-                  # Process VPN Connections
-                  print("\nProcessing VPN connections...")
-                  try:
-                      vpn_connections = get_vpn_connections(ec2, os.environ['VPN_TAG_PAIRS'])
-                      for vpn in vpn_connections:
-                          for tunnel in vpn['VgwTelemetry']:
-                              create_vpn_alarms(vpn['VpnConnectionId'], tunnel['OutsideIpAddress'], 
-                                              cloudwatch, sns_topic)
-                          processed_resources['vpn'] += 1
-                  except Exception as e:
-                      print(f"Error processing VPN connections: {str(e)}")
 
-                  # Process Direct Connect Connections
-                  print("\nProcessing Direct Connect connections...")
-                  try:
-                      dx_connections = get_direct_connect_connections(dx, os.environ['DX_TAG_PAIRS'])
-                      for conn in dx_connections:
-                          create_direct_connect_alarms(conn['connectionId'], cloudwatch, sns_topic)
-                          processed_resources['dx'] += 1
-                  except Exception as e:
-                      print(f"Error processing Direct Connect connections: {str(e)}")
+            def get_environment_threshold(prod, nonprod, shared, train, readonly):
+                """
+                Get threshold value based on environment
+                """
+                env = os.environ['ENVIRONMENT']
+                if env == 'prod':
+                    return prod
+                elif env == 'nonprod':
+                    return nonprod
+                elif env == 'shared':
+                    return shared
+                elif env == 'train':
+                    return train
+                return readonly
 
-                  # Process Transit Gateways
-                  print("\nProcessing Transit Gateways...")
-                  try:
-                      transit_gateways = get_transit_gateways(ec2, os.environ['TGW_TAG_PAIRS'])
-                      for tgw in transit_gateways:
-                          create_transit_gateway_alarms(tgw['TransitGatewayId'], cloudwatch, sns_topic)
-                          processed_resources['tgw'] += 1
-                  except Exception as e:
-                      print(f"Error processing Transit Gateways: {str(e)}")
+            def create_alarm(cloudwatch, alarm_config):
+                """
+                Create or update CloudWatch alarm
+                """
+                try:
+                    print(f"Creating alarm: {alarm_config['AlarmName']}")
+                    cloudwatch.put_metric_alarm(**alarm_config)
+                except Exception as e:
+                    print(f"Error creating alarm {alarm_config['AlarmName']}: {str(e)}")
 
-                  # Process WAF Web ACLs
-                  print("\nProcessing WAF Web ACLs...")
-                  try:
-                      web_acls = get_waf_acls(wafv2, os.environ['WAF_TAG_PAIRS'])
-                      for acl in web_acls:
-                          create_waf_alarms(acl['Id'], cloudwatch, sns_topic)
-                          processed_resources['waf'] += 1
-                  except Exception as e:
-                      print(f"Error processing WAF ACLs: {str(e)}")
+            def get_ec2_instances(ec2_client, tag_pairs_json):
+                """
+                Get EC2 instances based on tag pairs
+                """
+                print(f"\nEC2 tag configuration: {tag_pairs_json}")
+                tag_pairs = parse_tag_pairs(tag_pairs_json)
+                
+                # Basic filters
+                filters = [{'Name': 'instance-state-name', 'Values': ['running']}]
+                
+                instances = []
+                paginator = ec2_client.get_paginator('describe_instances')
+                
+                try:
+                    if tag_pairs:
+                        tag_filters = get_resources_by_tag_pairs(tag_pairs)
+                        filters.extend(tag_filters)
+                        print(f"Filtering EC2 instances with: {filters}")
+                        
+                        # Add this debug line
+                        print(f"Looking for instances with these tags: {tag_pairs}")
+                    else:
+                        print("No tag filters - discovering all running EC2 instances")
+                        
+                    for page in paginator.paginate(Filters=filters):
+                        for reservation in page['Reservations']:
+                            for instance in reservation['Instances']:
+                                # Add these debug lines
+                                print(f"\nEvaluating instance {instance['InstanceId']}:")
+                                print(f"Instance tags: {instance.get('Tags', [])}")
+                                
+                                if tags_match_all_criteria(instance.get('Tags', []), tag_pairs):
+                                    print(f"✓ Instance {instance['InstanceId']} MATCHES criteria")
+                                    instances.append(instance)
+                                else:
+                                    print(f"✗ Instance {instance['InstanceId']} does NOT match criteria")
+                                
+                    print(f"Total EC2 instances found: {len(instances)}")
+                    return instances
+                    
+                except Exception as e:
+                    print(f"Error in get_ec2_instances: {str(e)}")
+                    raise
 
-                  # Process Network Firewalls
-                  print("\nProcessing Network Firewalls...")
-                  try:
-                      firewalls = get_network_firewalls(networkfirewall, os.environ['NFW_TAG_PAIRS'])
-                      for fw in firewalls:
-                          create_network_firewall_alarms(fw['FirewallName'], cloudwatch, sns_topic)
-                          processed_resources['nfw'] += 1
-                  except Exception as e:
-                      print(f"Error processing Network Firewalls: {str(e)}")
 
-                  # Process RDS Instances
-                  print("\nProcessing RDS instances...")
-                  try:
-                      rds_instances = get_rds_instances(rds, os.environ['RDS_TAG_PAIRS'])
-                      for instance in rds_instances:
-                          create_rds_alarms(instance['DBInstanceIdentifier'], cloudwatch, sns_topic)
-                          processed_resources['rds'] += 1
-                  except Exception as e:
-                      print(f"Error processing RDS instances: {str(e)}")
+            def get_ebs_volumes(ec2_client, tag_pairs_json):
+                """
+                Get EBS volumes based on tag pairs
+                """
+                print(f"\nEBS tag configuration: {tag_pairs_json}")
+                tag_pairs = parse_tag_pairs(tag_pairs_json)
+                
+                # Basic filters
+                filters = [{'Name': 'status', 'Values': ['in-use']}]
+                
+                volumes = []
+                paginator = ec2_client.get_paginator('describe_volumes')
+                
+                try:
+                    if tag_pairs:
+                        tag_filters = get_resources_by_tag_pairs(tag_pairs)
+                        filters.extend(tag_filters)
+                        print(f"Filtering EBS volumes with: {filters}")
+                    else:
+                        print("No tag filters - discovering all in-use EBS volumes")
+                        
+                    for page in paginator.paginate(Filters=filters):
+                        for volume in page['Volumes']:
+                            print(f"Checking volume {volume['VolumeId']}:")
+                            print(f"Volume tags: {volume.get('Tags', [])}")
+                            if tag_pairs is None or tags_match_all_criteria(volume.get('Tags', []), tag_pairs):
+                                print(f"Volume {volume['VolumeId']} matches criteria")
+                                volumes.append(volume)
+                            else:
+                                print(f"Volume {volume['VolumeId']} does not match criteria")
+                                
+                    print(f"Total EBS volumes found: {len(volumes)}")
+                    return volumes
+                    
+                except Exception as e:
+                    print(f"Error in get_ebs_volumes: {str(e)}")
+                    raise
 
-                  # Process FSx File Systems
-                  print("\nProcessing FSx file systems...")
-                  try:
-                      # Windows File Systems
-                      windows_fs = get_fsx_filesystems(fsx, os.environ['FSX_WIN_TAG_PAIRS'], 'WINDOWS')
-                      for fs in windows_fs:
-                          create_fsx_alarms(fs['FileSystemId'], cloudwatch, sns_topic, 'WINDOWS')
-                          processed_resources['fsx_windows'] += 1
+            def get_load_balancers(elbv2_client, tag_pairs_json, lb_type):
+                """
+                Get Load Balancers based on tag pairs and type (application or network)
+                """
+                print(f"\n{lb_type} Load Balancer tag configuration: {tag_pairs_json}")
+                tag_pairs = parse_tag_pairs(tag_pairs_json)
+                
+                load_balancers = []
+                paginator = elbv2_client.get_paginator('describe_load_balancers')
+                
+                try:
+                    print(f"Discovering {lb_type} Load Balancers...")
+                    for page in paginator.paginate():
+                        for lb in page['LoadBalancers']:
+                            if lb['Type'].lower() != lb_type.lower():
+                                continue
+                                
+                            tags = elbv2_client.describe_tags(
+                                ResourceArns=[lb['LoadBalancerArn']])['TagDescriptions'][0]['Tags']
+                            
+                            print(f"Checking {lb_type} Load Balancer {lb['LoadBalancerName']}:")
+                            print(f"Load Balancer tags: {tags}")
+                            
+                            if tag_pairs is None or tags_match_all_criteria(tags, tag_pairs):
+                                print(f"Load Balancer {lb['LoadBalancerName']} matches criteria")
+                                load_balancers.append(lb)
+                            else:
+                                print(f"Load Balancer {lb['LoadBalancerName']} does not match criteria")
+                                
+                    print(f"Total {lb_type} Load Balancers found: {len(load_balancers)}")
+                    return load_balancers
+                    
+                except Exception as e:
+                    print(f"Error in get_load_balancers for {lb_type}: {str(e)}")
+                    raise
 
-                      # NetApp ONTAP File Systems
-                      netapp_fs = get_fsx_filesystems(fsx, os.environ['FSX_NETAPP_TAG_PAIRS'], 'ONTAP')
-                      for fs in netapp_fs:
-                          create_fsx_alarms(fs['FileSystemId'], cloudwatch, sns_topic, 'ONTAP')
-                          processed_resources['fsx_netapp'] += 1
-                  except Exception as e:
-                      print(f"Error processing FSx file systems: {str(e)}")
+            def get_vpn_connections(ec2_client, tag_pairs_json):
+                """
+                Get VPN connections based on tag pairs
+                """
+                print(f"\nVPN tag configuration: {tag_pairs_json}")
+                tag_pairs = parse_tag_pairs(tag_pairs_json)
+                
+                filters = []
+                
+                try:
+                    if tag_pairs:
+                        tag_filters = get_resources_by_tag_pairs(tag_pairs)
+                        filters.extend(tag_filters)
+                        print(f"Filtering VPN connections with: {filters}")
+                    else:
+                        print("No tag filters - discovering all VPN connections")
+                        
+                    response = ec2_client.describe_vpn_connections(Filters=filters)
+                    vpn_connections = []
+                    
+                    for vpn in response['VpnConnections']:
+                        print(f"Checking VPN connection {vpn['VpnConnectionId']}:")
+                        print(f"VPN tags: {vpn.get('Tags', [])}")
+                        
+                        if tag_pairs is None or tags_match_all_criteria(vpn.get('Tags', []), tag_pairs):
+                            print(f"VPN connection {vpn['VpnConnectionId']} matches criteria")
+                            vpn_connections.append(vpn)
+                        else:
+                            print(f"VPN connection {vpn['VpnConnectionId']} does not match criteria")
+                            
+                    print(f"Total VPN connections found: {len(vpn_connections)}")
+                    return vpn_connections
+                    
+                except Exception as e:
+                    print(f"Error in get_vpn_connections: {str(e)}")
+                    raise
 
-                  # Generate summary
-                  summary = {
-                      'timestamp': datetime.now(timezone.utc).isoformat(),
-                      'processed_resources': processed_resources,
-                      'total_resources': sum(processed_resources.values())
-                  }
+            def get_direct_connect_connections(dx_client, tag_pairs_json):
+                """
+                Get Direct Connect connections based on tag pairs
+                """
+                print(f"\nDirect Connect tag configuration: {tag_pairs_json}")
+                tag_pairs = parse_tag_pairs(tag_pairs_json)
+                
+                try:
+                    print("Discovering Direct Connect connections...")
+                    connections = dx_client.describe_connections()['connections']
+                    filtered_connections = []
+                    
+                    for conn in connections:
+                        # Convert DX tags to standard format
+                        dx_tags = conn.get('tags', [])
+                        standard_tags = [{'Key': tag.get('key', ''), 'Value': tag.get('value', '')} 
+                                    for tag in dx_tags]
+                        
+                        print(f"Checking Direct Connect connection {conn['connectionId']}:")
+                        print(f"Connection tags: {standard_tags}")
+                        
+                        if tag_pairs is None or tags_match_all_criteria(standard_tags, tag_pairs):
+                            print(f"Direct Connect connection {conn['connectionId']} matches criteria")
+                            filtered_connections.append(conn)
+                        else:
+                            print(f"Direct Connect connection {conn['connectionId']} does not match criteria")
+                            
+                    print(f"Total Direct Connect connections found: {len(filtered_connections)}")
+                    return filtered_connections
+                    
+                except Exception as e:
+                    print(f"Error in get_direct_connect_connections: {str(e)}")
+                    raise
+            def get_transit_gateways(ec2_client, tag_pairs_json):
+                """
+                Get Transit Gateways based on tag pairs
+                """
+                print(f"\nTransit Gateway tag configuration: {tag_pairs_json}")
+                tag_pairs = parse_tag_pairs(tag_pairs_json)
+                
+                filters = []
+                
+                try:
+                    if tag_pairs:
+                        tag_filters = get_resources_by_tag_pairs(tag_pairs)
+                        filters.extend(tag_filters)
+                        print(f"Filtering Transit Gateways with: {filters}")
+                    else:
+                        print("No tag filters - discovering all Transit Gateways")
+                        
+                    response = ec2_client.describe_transit_gateways(Filters=filters)
+                    tgws = []
+                    
+                    for tgw in response['TransitGateways']:
+                        print(f"Checking Transit Gateway {tgw['TransitGatewayId']}:")
+                        print(f"Transit Gateway tags: {tgw.get('Tags', [])}")
+                        
+                        if tag_pairs is None or tags_match_all_criteria(tgw.get('Tags', []), tag_pairs):
+                            print(f"Transit Gateway {tgw['TransitGatewayId']} matches criteria")
+                            tgws.append(tgw)
+                        else:
+                            print(f"Transit Gateway {tgw['TransitGatewayId']} does not match criteria")
+                            
+                    print(f"Total Transit Gateways found: {len(tgws)}")
+                    return tgws
+                    
+                except Exception as e:
+                    print(f"Error in get_transit_gateways: {str(e)}")
+                    raise
 
-                  print("\nExecution Summary:")
-                  print(json.dumps(summary, indent=2))
+            def get_waf_acls(wafv2_client, tag_pairs_json):
+                """
+                Get WAF ACLs based on tag pairs
+                """
+                print(f"\nWAF tag configuration: {tag_pairs_json}")
+                tag_pairs = parse_tag_pairs(tag_pairs_json)
+                
+                web_acls = []
+                
+                try:
+                    for scope in ['REGIONAL', 'CLOUDFRONT']:
+                        print(f"Discovering WAF Web ACLs in {scope} scope...")
+                        try:
+                            response = wafv2_client.list_web_acls(Scope=scope)
+                            for acl in response['WebACLs']:
+                                tags = wafv2_client.list_tags_for_resource(
+                                    ResourceARN=acl['ARN'])['TagList']
+                                
+                                print(f"Checking Web ACL {acl['Name']}:")
+                                print(f"Web ACL tags: {tags}")
+                                
+                                if tag_pairs is None or tags_match_all_criteria(tags, tag_pairs):
+                                    print(f"Web ACL {acl['Name']} matches criteria")
+                                    web_acls.append(acl)
+                                else:
+                                    print(f"Web ACL {acl['Name']} does not match criteria")
+                                    
+                        except Exception as e:
+                            print(f"Error getting WAF ACLs for scope {scope}: {str(e)}")
+                            
+                    print(f"Total WAF Web ACLs found: {len(web_acls)}")
+                    return web_acls
+                    
+                except Exception as e:
+                    print(f"Error in get_waf_acls: {str(e)}")
+                    raise
 
-                  return {
-                      'statusCode': 200,
-                      'body': json.dumps({
-                          'message': 'Alarms created successfully',
-                          'summary': summary
-                      })
-                  }
+            def get_network_firewalls(nfw_client, tag_pairs_json):
+                """
+                Get Network Firewalls based on tag pairs
+                """
+                print(f"\nNetwork Firewall tag configuration: {tag_pairs_json}")
+                tag_pairs = parse_tag_pairs(tag_pairs_json)
+                
+                firewalls = []
+                
+                try:
+                    print("Discovering Network Firewalls...")
+                    response = nfw_client.list_firewalls()
+                    
+                    for fw in response['Firewalls']:
+                        tags = nfw_client.list_tags_for_resource(
+                            ResourceArn=fw['FirewallArn'])['TagList']
+                        
+                        print(f"Checking Network Firewall {fw['FirewallName']}:")
+                        print(f"Firewall tags: {tags}")
+                        
+                        if tag_pairs is None or tags_match_all_criteria(tags, tag_pairs):
+                            print(f"Network Firewall {fw['FirewallName']} matches criteria")
+                            firewalls.append(fw)
+                        else:
+                            print(f"Network Firewall {fw['FirewallName']} does not match criteria")
+                            
+                    print(f"Total Network Firewalls found: {len(firewalls)}")
+                    return firewalls
+                    
+                except Exception as e:
+                    print(f"Error in get_network_firewalls: {str(e)}")
+                    raise
+            def get_rds_instances(rds_client, tag_pairs_json):
+                """
+                Get RDS instances based on tag pairs
+                """
+                print(f"\nRDS tag configuration: {tag_pairs_json}")
+                tag_pairs = parse_tag_pairs(tag_pairs_json)
+                
+                instances = []
+                paginator = rds_client.get_paginator('describe_db_instances')
+                
+                try:
+                    print("Discovering RDS instances...")
+                    for page in paginator.paginate():
+                        for instance in page['DBInstances']:
+                            tags = rds_client.list_tags_for_resource(
+                                ResourceName=instance['DBInstanceArn'])['TagList']
+                            
+                            print(f"Checking RDS instance {instance['DBInstanceIdentifier']}:")
+                            print(f"RDS instance tags: {tags}")
+                            
+                            if tag_pairs is None or tags_match_all_criteria(tags, tag_pairs):
+                                print(f"RDS instance {instance['DBInstanceIdentifier']} matches criteria")
+                                instances.append(instance)
+                            else:
+                                print(f"RDS instance {instance['DBInstanceIdentifier']} does not match criteria")
+                                
+                    print(f"Total RDS instances found: {len(instances)}")
+                    return instances
+                    
+                except Exception as e:
+                    print(f"Error in get_rds_instances: {str(e)}")
+                    raise
 
-              except Exception as e:
-                  print(f"Error in lambda_handler: {str(e)}")
-                  raise
+            def get_fsx_filesystems(fsx_client, tag_pairs_json, filesystem_type):
+                """
+                Get FSx filesystems based on tag pairs and type
+                """
+                print(f"\nFSx {filesystem_type} tag configuration: {tag_pairs_json}")
+                tag_pairs = parse_tag_pairs(tag_pairs_json)
+                
+                filesystems = []
+                
+                try:
+                    print(f"Discovering FSx {filesystem_type} filesystems...")
+                    paginator = fsx_client.get_paginator('describe_file_systems')
+                    
+                    for page in paginator.paginate():
+                        for fs in page['FileSystems']:
+                            if fs['FileSystemType'] != filesystem_type:
+                                continue
+                                
+                            print(f"Checking FSx filesystem {fs['FileSystemId']}:")
+                            print(f"Filesystem tags: {fs.get('Tags', [])}")
+                            
+                            if tag_pairs is None or tags_match_all_criteria(fs.get('Tags', []), tag_pairs):
+                                print(f"FSx filesystem {fs['FileSystemId']} matches criteria")
+                                filesystems.append(fs)
+                            else:
+                                print(f"FSx filesystem {fs['FileSystemId']} does not match criteria")
+                                
+                    print(f"Total FSx {filesystem_type} filesystems found: {len(filesystems)}")
+                    return filesystems
+                    
+                except Exception as e:
+                    print(f"Error in get_fsx_filesystems for {filesystem_type}: {str(e)}")
+                    raise
+
+
+
+            def create_ec2_alarms(instance_id, cloudwatch, sns_topic):
+                """
+                Create EC2 instance alarms
+                """
+                # CPU Utilization
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-EC2-CPUUtilization-{instance_id}',
+                    'MetricName': 'CPUUtilization',
+                    'Namespace': 'AWS/EC2',
+                    'Statistic': 'Average',
+                    'Dimensions': [{'Name': 'InstanceId', 'Value': instance_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': get_environment_threshold(80, 85, 85, 90, 90),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'missing',
+                    'Unit': 'Percent'
+                })
+
+                # Memory Utilization (requires CW Agent)
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-EC2-MemoryUtilization-{instance_id}',
+                    'MetricName': 'Memory % Committed Bytes In Use',
+                    'Namespace': 'CWAgent',
+                    'Statistic': 'Average',
+                    'Dimensions': [{'Name': 'InstanceId', 'Value': instance_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': get_environment_threshold(80, 85, 85, 90, 90),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'missing',
+                    'Unit': 'Percent'
+                })
+
+                # Status Check
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-EC2-StatusCheck-{instance_id}',
+                    'MetricName': 'StatusCheckFailed',
+                    'Namespace': 'AWS/EC2',
+                    'Statistic': 'Maximum',
+                    'Dimensions': [{'Name': 'InstanceId', 'Value': instance_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': 1,
+                    'ComparisonOperator': 'GreaterThanOrEqualToThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'breaching',
+                    'Unit': 'Count'
+                })
+
+                # Credit Balance (for T-type instances)
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-EC2-CreditBalance-{instance_id}',
+                    'MetricName': 'CPUCreditBalance',
+                    'Namespace': 'AWS/EC2',
+                    'Statistic': 'Average',
+                    'Dimensions': [{'Name': 'InstanceId', 'Value': instance_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': 20,
+                    'ComparisonOperator': 'LessThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'missing',
+                    'Unit': 'Count'
+                })
+
+            def create_ebs_alarms(volume_id, volume_type, cloudwatch, sns_topic):
+                """
+                Create EBS volume alarms
+                """
+                # Space Utilization
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-EBS-SpaceUtilization-{volume_id}',
+                    'MetricName': 'VolumeUsedPercent',
+                    'Namespace': 'AWS/EBS',
+                    'Statistic': 'Average',
+                    'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': get_environment_threshold(75, 80, 80, 85, 85),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'missing',
+                    'Unit': 'Percent'
+                })
+
+                # IOPS
+                iops_threshold = 10000 if volume_type == 'io2' else 3000
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-EBS-IOPS-{volume_id}',
+                    'MetricName': 'VolumeReadOps',
+                    'Namespace': 'AWS/EBS',
+                    'Statistic': 'Sum',
+                    'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': iops_threshold,
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'ignore',
+                    'Unit': 'Count/Second'
+                })
+
+                # Queue Length
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-EBS-QueueLength-{volume_id}',
+                    'MetricName': 'VolumeQueueLength',
+                    'Namespace': 'AWS/EBS',
+                    'Statistic': 'Average',
+                    'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': 1,
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'ignore',
+                    'Unit': 'Count'
+                })
+
+                # Burst Balance (for gp2/gp3)
+                if volume_type in ['gp2', 'gp3']:
+                    create_alarm(cloudwatch, {
+                        'AlarmName': f'Epic-EBS-BurstBalance-{volume_id}',
+                        'MetricName': 'BurstBalance',
+                        'Namespace': 'AWS/EBS',
+                        'Statistic': 'Average',
+                        'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}],
+                        'Period': 300,
+                        'EvaluationPeriods': 2,
+                        'Threshold': 20,
+                        'ComparisonOperator': 'LessThanThreshold',
+                        'AlarmActions': [sns_topic],
+                        'TreatMissingData': 'missing',
+                        'Unit': 'Percent'
+                    })
+
+            def create_alb_alarms(alb_arn, cloudwatch, sns_topic):
+                """
+                Create Application Load Balancer alarms
+                """
+                alb_name = alb_arn.split('/')[-1]
+                
+                # Active Connections
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-ALB-ActiveConnections-{alb_name}',
+                    'MetricName': 'ActiveConnectionCount',
+                    'Namespace': 'AWS/ApplicationELB',
+                    'Statistic': 'Sum',
+                    'Dimensions': [{'Name': 'LoadBalancer', 'Value': alb_arn}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': get_environment_threshold(5000, 2000, 2000, 1000, 1000),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'ignore',
+                    'Unit': 'Count'
+                })
+
+                # 5XX Errors
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-ALB-5XXErrors-{alb_name}',
+                    'MetricName': 'HTTPCode_ELB_5XX_Count',
+                    'Namespace': 'AWS/ApplicationELB',
+                    'Statistic': 'Sum',
+                    'Dimensions': [{'Name': 'LoadBalancer', 'Value': alb_arn}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': get_environment_threshold(10, 20, 20, 50, 50),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'ignore',
+                    'Unit': 'Count'
+                })
+
+                # Response Time
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-ALB-ResponseTime-{alb_name}',
+                    'MetricName': 'TargetResponseTime',
+                    'Namespace': 'AWS/ApplicationELB',
+                    'Statistic': 'Average',
+                    'Dimensions': [{'Name': 'LoadBalancer', 'Value': alb_arn}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': get_environment_threshold(1, 2, 2, 5, 5),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'ignore',
+                    'Unit': 'Seconds'
+                })
+
+            def create_nlb_alarms(nlb_arn, cloudwatch, sns_topic):
+                """
+                Create Network Load Balancer alarms
+                """
+                nlb_name = nlb_arn.split('/')[-1]
+                
+                # Active Connections
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-NLB-ActiveConnections-{nlb_name}',
+                    'MetricName': 'ActiveFlowCount',
+                    'Namespace': 'AWS/NetworkELB',
+                    'Statistic': 'Sum',
+                    'Dimensions': [{'Name': 'LoadBalancer', 'Value': nlb_arn}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': get_environment_threshold(5000, 2000, 2000, 1000, 1000),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'ignore',
+                    'Unit': 'Count'
+                })
+
+                # TCP Reset Count
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-NLB-TCPResetCount-{nlb_name}',
+                    'MetricName': 'TCP_Reset_Count',
+                    'Namespace': 'AWS/NetworkELB',
+                    'Statistic': 'Sum',
+                    'Dimensions': [{'Name': 'LoadBalancer', 'Value': nlb_arn}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': get_environment_threshold(100, 200, 200, 500, 500),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'ignore',
+                    'Unit': 'Count'
+                })
+
+            def create_vpn_alarms(vpn_id, tunnel_address, cloudwatch, sns_topic):
+                """
+                Create VPN connection alarms
+                """
+                # Tunnel Status
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-VPN-TunnelStatus-{vpn_id}-{tunnel_address}',
+                    'MetricName': 'TunnelState',
+                    'Namespace': 'AWS/VPN',
+                    'Statistic': 'Minimum',
+                    'Dimensions': [
+                        {'Name': 'VpnId', 'Value': vpn_id},
+                        {'Name': 'TunnelIpAddress', 'Value': tunnel_address}
+                    ],
+                    'Period': 300,
+                    'EvaluationPeriods': 1,
+                    'Threshold': 0,
+                    'ComparisonOperator': 'LessThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'breaching',
+                    'Unit': 'None'
+                })
+
+                # Bytes In
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-VPN-BytesIn-{vpn_id}-{tunnel_address}',
+                    'MetricName': 'TunnelDataIn',
+                    'Namespace': 'AWS/VPN',
+                    'Statistic': 'Average',
+                    'Dimensions': [
+                        {'Name': 'VpnId', 'Value': vpn_id},
+                        {'Name': 'TunnelIpAddress', 'Value': tunnel_address}
+                    ],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': get_environment_threshold(100000000, 100000000, 100000000, 100000000, 100000000),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'ignore',
+                    'Unit': 'Bytes'
+                })
+
+            def create_direct_connect_alarms(connection_id, cloudwatch, sns_topic):
+                """
+                Create Direct Connect alarms
+                """
+                # Connection Status
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-DirectConnect-ConnectionStatus-{connection_id}',
+                    'MetricName': 'ConnectionState',
+                    'Namespace': 'AWS/DX',
+                    'Statistic': 'Minimum',
+                    'Dimensions': [{'Name': 'ConnectionId', 'Value': connection_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 1,
+                    'Threshold': 0,
+                    'ComparisonOperator': 'LessThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'breaching',
+                    'Unit': 'None'
+                })
+
+                # Bandwidth Utilization
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-DirectConnect-BandwidthUtilization-{connection_id}',
+                    'MetricName': 'ConnectionBpsEgress',
+                    'Namespace': 'AWS/DX',
+                    'Statistic': 'Average',
+                    'Dimensions': [{'Name': 'ConnectionId', 'Value': connection_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': get_environment_threshold(80, 85, 85, 90, 90),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'ignore',
+                    'Unit': 'Percent'
+                })
+
+            def create_transit_gateway_alarms(tgw_id, cloudwatch, sns_topic):
+                """
+                Create Transit Gateway alarms
+                """
+                # Bytes Dropped
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-TransitGateway-BytesDropped-{tgw_id}',
+                    'MetricName': 'BytesDropCountBlackhole',
+                    'Namespace': 'AWS/TransitGateway',
+                    'Statistic': 'Sum',
+                    'Dimensions': [{'Name': 'TransitGateway', 'Value': tgw_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': 1000,
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'ignore',
+                    'Unit': 'Bytes'
+                })
+
+                # Packet Drop Count
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-TransitGateway-PacketDropCount-{tgw_id}',
+                    'MetricName': 'PacketDropCountBlackhole',
+                    'Namespace': 'AWS/TransitGateway',
+                    'Statistic': 'Sum',
+                    'Dimensions': [{'Name': 'TransitGateway', 'Value': tgw_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': 1000,
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'ignore',
+                    'Unit': 'Count'
+                })
+
+            def create_waf_alarms(web_acl_id, cloudwatch, sns_topic):
+                """
+                Create WAF alarms
+                """
+                # Blocked Requests
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-WAF-BlockedRequests-{web_acl_id}',
+                    'MetricName': 'BlockedRequests',
+                    'Namespace': 'AWS/WAFV2',
+                    'Statistic': 'Sum',
+                    'Dimensions': [{'Name': 'WebACL', 'Value': web_acl_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': get_environment_threshold(1000, 2000, 2000, 5000, 5000),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'ignore',
+                    'Unit': 'Count'
+                })
+
+                # Allowed Requests Rate
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-WAF-AllowedRequestsRate-{web_acl_id}',
+                    'MetricName': 'AllowedRequests',
+                    'Namespace': 'AWS/WAFV2',
+                    'Statistic': 'Average',
+                    'Dimensions': [{'Name': 'WebACL', 'Value': web_acl_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': get_environment_threshold(10000, 20000, 20000, 50000, 50000),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'ignore',
+                    'Unit': 'Count'
+                })
+
+            def create_network_firewall_alarms(firewall_name, cloudwatch, sns_topic):
+                """
+                Create Network Firewall alarms
+                """
+                # Drop Packets
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-NetworkFirewall-DroppedPackets-{firewall_name}',
+                    'MetricName': 'DroppedPackets',
+                    'Namespace': 'AWS/NetworkFirewall',
+                    'Statistic': 'Sum',
+                    'Dimensions': [{'Name': 'FirewallName', 'Value': firewall_name}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': get_environment_threshold(1000, 2000, 2000, 5000, 5000),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'ignore',
+                    'Unit': 'Count'
+                })
+
+                # Alert Count
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-NetworkFirewall-AlertCount-{firewall_name}',
+                    'MetricName': 'AlertCount',
+                    'Namespace': 'AWS/NetworkFirewall',
+                    'Statistic': 'Sum',
+                    'Dimensions': [{'Name': 'FirewallName', 'Value': firewall_name}],
+                    'Period': 300,
+                    'EvaluationPeriods': 2,
+                    'Threshold': get_environment_threshold(100, 200, 200, 500, 500),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'ignore',
+                    'Unit': 'Count'
+                })
+
+            def create_rds_alarms(instance_id, cloudwatch, sns_topic):
+                """
+                Create RDS alarms
+                """
+                # CPU Utilization
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-RDS-CPUUtilization-{instance_id}',
+                    'MetricName': 'CPUUtilization',
+                    'Namespace': 'AWS/RDS',
+                    'Statistic': 'Maximum',
+                    'Dimensions': [{'Name': 'DBInstanceIdentifier', 'Value': instance_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 5,
+                    'Threshold': get_environment_threshold(80, 85, 85, 90, 90),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'missing',
+                    'Unit': 'Percent'
+                })
+
+                # Freeable Memory
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-RDS-FreeableMemory-{instance_id}',
+                    'MetricName': 'FreeableMemory',
+                    'Namespace': 'AWS/RDS',
+                    'Statistic': 'Minimum',
+                    'Dimensions': [{'Name': 'DBInstanceIdentifier', 'Value': instance_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 5,
+                    'Threshold': 2048,
+                    'ComparisonOperator': 'LessThanOrEqualToThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'missing',
+                    'Unit': 'Megabytes'
+                })
+
+                # Read Latency
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-RDS-ReadLatency-{instance_id}',
+                    'MetricName': 'ReadLatency',
+                    'Namespace': 'AWS/RDS',
+                    'Statistic': 'Average',
+                    'Dimensions': [{'Name': 'DBInstanceIdentifier', 'Value': instance_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 3,
+                    'Threshold': 0.02,  # 20 milliseconds
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'missing',
+                    'Unit': 'Seconds'
+                })
+
+                # Write Latency
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-RDS-WriteLatency-{instance_id}',
+                    'MetricName': 'WriteLatency',
+                    'Namespace': 'AWS/RDS',
+                    'Statistic': 'Average',
+                    'Dimensions': [{'Name': 'DBInstanceIdentifier', 'Value': instance_id}],
+                    'Period': 300,
+                    'EvaluationPeriods': 3,
+                    'Threshold': 0.02,  # 20 milliseconds
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'missing',
+                    'Unit': 'Seconds'
+                })
+
+            def create_fsx_alarms(file_system_id, cloudwatch, sns_topic, filesystem_type):
+                """
+                Create FSx alarms
+                """
+                # Storage Capacity Utilization
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-FSx-{filesystem_type}-StorageCapacityUtilization-{file_system_id}',
+                    'MetricName': 'StorageCapacityUtilization',
+                    'Namespace': 'AWS/FSx',
+                    'Statistic': 'Average',
+                    'Dimensions': [{'Name': 'FileSystemId', 'Value': file_system_id}],
+                    'Period': 900,
+                    'EvaluationPeriods': 2,
+                    'Threshold': get_environment_threshold(80, 85, 85, 90, 90),
+                    'ComparisonOperator': 'GreaterThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'missing',
+                    'Unit': 'Percent'
+                })
+
+                # Free Storage Capacity
+                create_alarm(cloudwatch, {
+                    'AlarmName': f'Epic-FSx-{filesystem_type}-FreeStorageCapacity-{file_system_id}',
+                    'MetricName': 'FreeStorageCapacity',
+                    'Namespace': 'AWS/FSx',
+                    'Statistic': 'Average',
+                    'Dimensions': [{'Name': 'FileSystemId', 'Value': file_system_id}],
+                    'Period': 900,
+                    'EvaluationPeriods': 2,
+                    'Threshold': 10,
+                    'ComparisonOperator': 'LessThanThreshold',
+                    'AlarmActions': [sns_topic],
+                    'TreatMissingData': 'missing',
+                    'Unit': 'Gigabytes'
+                })
+
+                if filesystem_type == 'ONTAP':  # Additional metrics for FSx for NetApp ONTAP
+                    # Network Throughput
+                    create_alarm(cloudwatch, {
+                        'AlarmName': f'Epic-FSx-ONTAP-NetworkThroughput-{file_system_id}',
+                        'MetricName': 'NetworkThroughputUtilization',
+                        'Namespace': 'AWS/FSx',
+                        'Statistic': 'Average',
+                        'Dimensions': [{'Name': 'FileSystemId', 'Value': file_system_id}],
+                        'Period': 300,
+                        'EvaluationPeriods': 2,
+                        'Threshold': get_environment_threshold(80, 85, 85, 90, 90),
+                        'ComparisonOperator': 'GreaterThanThreshold',
+                        'AlarmActions': [sns_topic],
+                        'TreatMissingData': 'missing',
+                        'Unit': 'Percent'
+                    })
+
+            def get_tag_configuration(resource_type):
+                """
+                Get tag configuration from SSM Parameter Store
+                """
+                try:
+                    ssm = boto3.client('ssm')
+                    response = ssm.get_parameter(
+                        Name=f'/epic/monitoring/{resource_type}-tags'
+                    )
+                    print(f"Retrieved {resource_type} tag configuration from SSM: {response['Parameter']['Value']}")
+                    return response['Parameter']['Value']
+                except Exception as e:
+                    print(f"Error getting tag configuration for {resource_type}: {str(e)}")
+                    return '[{"key":"Environment","value":""}]'  # default fallback
+
+            def lambda_handler(event, context):
+                """
+                Main Lambda function handler
+                """
+                try:
+                    print("Starting Epic Monitoring Lambda function...")
+                    
+                    # Initialize AWS clients
+                    cloudwatch = boto3.client('cloudwatch')
+                    ec2 = boto3.client('ec2')
+                    elbv2 = boto3.client('elbv2')
+                    rds = boto3.client('rds')
+                    dx = boto3.client('directconnect')
+                    wafv2 = boto3.client('wafv2')
+                    networkfirewall = boto3.client('network-firewall')
+                    fsx = boto3.client('fsx')
+                    
+                    sns_topic = os.environ['SNS_TOPIC']
+                    
+                    processed_resources = {
+                        'ec2': 0,
+                        'ebs': 0,
+                        'alb': 0,
+                        'nlb': 0,
+                        'vpn': 0,
+                        'dx': 0,
+                        'tgw': 0,
+                        'waf': 0,
+                        'nfw': 0,
+                        'rds': 0,
+                        'fsx_windows': 0,
+                        'fsx_netapp': 0
+                    }
+
+                    # Process EC2 Instances
+                    print("\nProcessing EC2 instances...")
+                    try:
+                        ec2_tag_pairs = get_tag_configuration('ec2')
+                        instances = get_ec2_instances(ec2, ec2_tag_pairs)
+                        for instance in instances:
+                            create_ec2_alarms(instance['InstanceId'], cloudwatch, sns_topic)
+                            processed_resources['ec2'] += 1
+                    except Exception as e:
+                        print(f"Error processing EC2 instances: {str(e)}")
+
+                    # Process EBS Volumes
+                    print("\nProcessing EBS volumes...")
+                    try:
+                        ebs_tag_pairs = get_tag_configuration('ebs')
+                        volumes = get_ebs_volumes(ec2, ebs_tag_pairs)
+                        for volume in volumes:
+                            create_ebs_alarms(volume['VolumeId'], volume['VolumeType'], cloudwatch, sns_topic)
+                            processed_resources['ebs'] += 1
+                    except Exception as e:
+                        print(f"Error processing EBS volumes: {str(e)}")
+
+                    # Process Application Load Balancers
+                    print("\nProcessing Application Load Balancers...")
+                    try:
+                        alb_tag_pairs = get_tag_configuration('alb')
+                        albs = get_load_balancers(elbv2, alb_tag_pairs, 'application')
+                        for alb in albs:
+                            create_alb_alarms(alb['LoadBalancerArn'], cloudwatch, sns_topic)
+                            processed_resources['alb'] += 1
+                    except Exception as e:
+                        print(f"Error processing ALBs: {str(e)}")
+
+                    # Process Network Load Balancers
+                    print("\nProcessing Network Load Balancers...")
+                    try:
+                        nlb_tag_pairs = get_tag_configuration('nlb')
+                        nlbs = get_load_balancers(elbv2, nlb_tag_pairs, 'network')
+                        for nlb in nlbs:
+                            create_nlb_alarms(nlb['LoadBalancerArn'], cloudwatch, sns_topic)
+                            processed_resources['nlb'] += 1
+                    except Exception as e:
+                        print(f"Error processing NLBs: {str(e)}")
+
+                    # Process VPN Connections
+                    print("\nProcessing VPN connections...")
+                    try:
+                        vpn_tag_pairs = get_tag_configuration('vpn')
+                        vpn_connections = get_vpn_connections(ec2, vpn_tag_pairs)
+                        for vpn in vpn_connections:
+                            for tunnel in vpn['VgwTelemetry']:
+                                create_vpn_alarms(vpn['VpnConnectionId'], tunnel['OutsideIpAddress'], 
+                                                cloudwatch, sns_topic)
+                            processed_resources['vpn'] += 1
+                    except Exception as e:
+                        print(f"Error processing VPN connections: {str(e)}")
+
+                    # Process Direct Connect Connections
+                    print("\nProcessing Direct Connect connections...")
+                    try:
+                        dx_tag_pairs = get_tag_configuration('dx')
+                        dx_connections = get_direct_connect_connections(dx, dx_tag_pairs)
+                        for conn in dx_connections:
+                            create_direct_connect_alarms(conn['connectionId'], cloudwatch, sns_topic)
+                            processed_resources['dx'] += 1
+                    except Exception as e:
+                        print(f"Error processing Direct Connect connections: {str(e)}")
+
+                    # Process Transit Gateways
+                    print("\nProcessing Transit Gateways...")
+                    try:
+                        tgw_tag_pairs = get_tag_configuration('tgw')
+                        transit_gateways = get_transit_gateways(ec2, tgw_tag_pairs)
+                        for tgw in transit_gateways:
+                            create_transit_gateway_alarms(tgw['TransitGatewayId'], cloudwatch, sns_topic)
+                            processed_resources['tgw'] += 1
+                    except Exception as e:
+                        print(f"Error processing Transit Gateways: {str(e)}")
+
+                    # Process WAF Web ACLs
+                    print("\nProcessing WAF Web ACLs...")
+                    try:
+                        waf_tag_pairs = get_tag_configuration('waf')
+                        web_acls = get_waf_acls(wafv2, waf_tag_pairs)
+                        for acl in web_acls:
+                            create_waf_alarms(acl['Id'], cloudwatch, sns_topic)
+                            processed_resources['waf'] += 1
+                    except Exception as e:
+                        print(f"Error processing WAF ACLs: {str(e)}")
+
+                    # Process Network Firewalls
+                    print("\nProcessing Network Firewalls...")
+                    try:
+                        nfw_tag_pairs = get_tag_configuration('nfw')
+                        firewalls = get_network_firewalls(networkfirewall, nfw_tag_pairs)
+                        for fw in firewalls:
+                            create_network_firewall_alarms(fw['FirewallName'], cloudwatch, sns_topic)
+                            processed_resources['nfw'] += 1
+                    except Exception as e:
+                        print(f"Error processing Network Firewalls: {str(e)}")
+
+                    # Process RDS Instances
+                    print("\nProcessing RDS instances...")
+                    try:
+                        rds_tag_pairs = get_tag_configuration('rds')
+                        rds_instances = get_rds_instances(rds, rds_tag_pairs)
+                        for instance in rds_instances:
+                            create_rds_alarms(instance['DBInstanceIdentifier'], cloudwatch, sns_topic)
+                            processed_resources['rds'] += 1
+                    except Exception as e:
+                        print(f"Error processing RDS instances: {str(e)}")
+
+                    # Process FSx File Systems
+                    print("\nProcessing FSx file systems...")
+                    try:
+                        # Windows File Systems
+                        fsxwin_tag_pairs = get_tag_configuration('fsxwin')
+                        windows_fs = get_fsx_filesystems(fsx, fsxwin_tag_pairs, 'WINDOWS')
+                        for fs in windows_fs:
+                            create_fsx_alarms(fs['FileSystemId'], cloudwatch, sns_topic, 'WINDOWS')
+                            processed_resources['fsx_windows'] += 1
+
+                        # NetApp ONTAP File Systems
+                        fsxnetapp_tag_pairs = get_tag_configuration('fsxnetapp')
+                        netapp_fs = get_fsx_filesystems(fsx, fsxnetapp_tag_pairs, 'ONTAP')
+                        for fs in netapp_fs:
+                            create_fsx_alarms(fs['FileSystemId'], cloudwatch, sns_topic, 'ONTAP')
+                            processed_resources['fsx_netapp'] += 1
+                    except Exception as e:
+                        print(f"Error processing FSx file systems: {str(e)}")
+
+                    # Generate summary
+                    summary = {
+                        'timestamp': datetime.now(timezone.utc).isoformat(),
+                        'processed_resources': processed_resources,
+                        'total_resources': sum(processed_resources.values())
+                    }
+
+                    print("\nExecution Summary:")
+                    print(json.dumps(summary, indent=2))
+
+                    return {
+                        'statusCode': 200,
+                        'body': json.dumps({
+                            'message': 'Alarms created successfully',
+                            'summary': summary
+                        })
+                    }
+
+                except Exception as e:
+                    print(f"Error in lambda_handler: {str(e)}")
+                    raise
+
 
       Runtime: python3.9
       Timeout: 900
@@ -1223,18 +1461,6 @@ Resources:
         Variables:
           SNS_TOPIC: !Ref MonitoringSNSTopic
           ENVIRONMENT: !Ref Environment
-          EC2_TAG_PAIRS: !Ref EC2TagPairs
-          EBS_TAG_PAIRS: !Ref EBSTagPairs
-          ALB_TAG_PAIRS: !Ref ALBTagPairs
-          NLB_TAG_PAIRS: !Ref NLBTagPairs
-          VPN_TAG_PAIRS: !Ref VPNTagPairs
-          DX_TAG_PAIRS: !Ref DXTagPairs
-          TGW_TAG_PAIRS: !Ref TGWTagPairs
-          WAF_TAG_PAIRS: !Ref WAFTagPairs
-          NFW_TAG_PAIRS: !Ref NFWTagPairs
-          RDS_TAG_PAIRS: !Ref RDSTagPairs
-          FSX_WIN_TAG_PAIRS: !Ref FSxWinTagPairs
-          FSX_NETAPP_TAG_PAIRS: !Ref FSxNetAppTagPairs
 
   MonitoringLambdaRole:
     Type: AWS::IAM::Role
@@ -1255,26 +1481,77 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  - cloudwatch:PutMetricAlarm
-                  - cloudwatch:DeleteAlarms
-                  - cloudwatch:DescribeAlarms
-                  - ec2:DescribeInstances
-                  - ec2:DescribeVolumes
-                  - ec2:DescribeVpnConnections
-                  - ec2:DescribeTransitGateways
-                  - elasticloadbalancing:DescribeLoadBalancers
-                  - elasticloadbalancing:DescribeTags
-                  - rds:DescribeDBInstances
-                  - rds:ListTagsForResource
-                  - directconnect:DescribeConnections
-                  - directconnect:DescribeTags
-                  - wafv2:ListWebACLs
-                  - wafv2:ListTagsForResource
-                  - network-firewall:ListFirewalls
-                  - network-firewall:ListTagsForResource
-                  - fsx:DescribeFileSystems
-                  - sns:Publish
+                  # CloudWatch Permissions
+                  - 'cloudwatch:PutMetricAlarm'
+                  - 'cloudwatch:DeleteAlarms'
+                  - 'cloudwatch:DescribeAlarms'
+                  - 'cloudwatch:GetMetricStatistics'
+                  - 'cloudwatch:GetMetricData'
+                  - 'cloudwatch:ListMetrics'
+                  
+                  # EC2 Related Permissions
+                  - 'ec2:DescribeInstances'
+                  - 'ec2:DescribeVolumes'
+                  - 'ec2:DescribeVpnConnections'
+                  - 'ec2:DescribeTransitGateways'
+                  
+                  # Load Balancer Permissions
+                  - 'elasticloadbalancing:DescribeLoadBalancers'
+                  - 'elasticloadbalancing:DescribeTargetGroups'
+                  - 'elasticloadbalancing:DescribeTargetHealth'
+                  - 'elasticloadbalancing:DescribeTags'
+                  
+                  # RDS Permissions
+                  - 'rds:DescribeDBInstances'
+                  - 'rds:DescribeDBClusters'
+                  - 'rds:ListTagsForResource'
+                  
+                  # Direct Connect Permissions
+                  - 'directconnect:DescribeConnections'
+                  - 'directconnect:DescribeTags'
+                  
+                  # WAF Permissions
+                  - 'wafv2:ListWebACLs'
+                  - 'wafv2:GetWebACL'
+                  - 'wafv2:ListTagsForResource'
+                  
+                  # Network Firewall Permissions
+                  - 'network-firewall:ListFirewalls'
+                  - 'network-firewall:DescribeFirewall'
+                  - 'network-firewall:ListTagsForResource'
+                  
+                  # FSx Permissions
+                  - 'fsx:DescribeFileSystems'
+                  
+                  # SNS Permissions
+                  - 'sns:Publish'
+                  - 'sns:ListTopics'
+                  
+                  # CloudWatch Logs Permissions
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  
+                  # SSM Parameter Store Permissions
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                  - 'ssm:DescribeParameters'
                 Resource: '*'
+
+              # Specific resource permissions for SNS
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref MonitoringSNSTopic
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Monitoring-Role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
 
   MonitoringSNSTopic:
     Type: AWS::SNS::Topic

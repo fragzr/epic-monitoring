@@ -5,37 +5,196 @@ Parameters:
   ProjectName:
     Type: String
     Default: 'Epic'
+    Description: 'Project name for resource tagging'
+  
   NotificationEmail:
     Type: String
     Description: 'Email address for notifications'
-  ResourceTagKey:
+  
+  S3BucketName:
     Type: String
-    Default: 'Environment'
-    Description: 'Tag key for identifying resources'
+    Description: 'S3 bucket containing nested stack templates'
+  
+  S3KeyPrefix:
+    Type: String
+    Description: 'S3 key prefix for nested stack templates'
+    Default: ''
 
 Mappings:
   AccountEnvironment:
     "841125194518":  # Production Account ID
-      Environment: "prod"
-      ResourceTagValue: "PROD"
+      Environment: "PROD"
     "461605441988":  # Non-Production Account ID
-      Environment: "nonprod"
-      ResourceTagValue: "NONPROD"
+      Environment: "NONPROD"
     "852325766660":  # Shared Account ID
-      Environment: "shared"
-      ResourceTagValue: "SHARED"
+      Environment: "SHARED"
     "253647676190":  # Training Account ID
-      Environment: "train"
-      ResourceTagValue: "TRAIN"
+      Environment: "TRAIN"
     "227932815323":  # Read-only Account ID
-      Environment: "readonly"
-      ResourceTagValue: "READONLY"
+      Environment: "READONLY"
 
 Resources:
+  # SSM Parameters for all service tag configurations
+  EC2TagsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/epic/monitoring/ec2-tags'
+      Type: String
+      Value: !Join
+        - ''
+        - - '['
+          - '{"key":"Environment","value":"'
+          - !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+          - '"}]'
+      Description: 'Tag configuration for EC2 instances'
+
+  EBSTagsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/epic/monitoring/ebs-tags'
+      Type: String
+      Value: !Join
+        - ''
+        - - '['
+          - '{"key":"Environment","value":"'
+          - !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+          - '"}]'
+      Description: 'Tag configuration for EBS volumes'
+
+  ALBTagsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/epic/monitoring/alb-tags'
+      Type: String
+      Value: !Join
+        - ''
+        - - '['
+          - '{"key":"Environment","value":"'
+          - !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+          - '"}]'
+      Description: 'Tag configuration for Application Load Balancers'
+
+  NLBTagsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/epic/monitoring/nlb-tags'
+      Type: String
+      Value: !Join
+        - ''
+        - - '['
+          - '{"key":"Environment","value":"'
+          - !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+          - '"}]'
+      Description: 'Tag configuration for Network Load Balancers'
+
+  VPNTagsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/epic/monitoring/vpn-tags'
+      Type: String
+      Value: !Join
+        - ''
+        - - '['
+          - '{"key":"Environment","value":"'
+          - !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+          - '"}]'
+      Description: 'Tag configuration for VPN connections'
+
+  DXTagsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/epic/monitoring/dx-tags'
+      Type: String
+      Value: !Join
+        - ''
+        - - '['
+          - '{"key":"Environment","value":"'
+          - !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+          - '"}]'
+      Description: 'Tag configuration for Direct Connect connections'
+
+  TGWTagsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/epic/monitoring/tgw-tags'
+      Type: String
+      Value: !Join
+        - ''
+        - - '['
+          - '{"key":"Environment","value":"'
+          - !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+          - '"}]'
+      Description: 'Tag configuration for Transit Gateways'
+
+  WAFTagsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/epic/monitoring/waf-tags'
+      Type: String
+      Value: !Join
+        - ''
+        - - '['
+          - '{"key":"Environment","value":"'
+          - !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+          - '"}]'
+      Description: 'Tag configuration for WAF ACLs'
+
+  NFWTagsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/epic/monitoring/nfw-tags'
+      Type: String
+      Value: !Join
+        - ''
+        - - '['
+          - '{"key":"Environment","value":"'
+          - !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+          - '"}]'
+      Description: 'Tag configuration for Network Firewalls'
+
+  RDSTagsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/epic/monitoring/rds-tags'
+      Type: String
+      Value: !Join
+        - ''
+        - - '['
+          - '{"key":"Environment","value":"'
+          - !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+          - '"}]'
+      Description: 'Tag configuration for RDS instances'
+
+  FSxWinTagsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/epic/monitoring/fsxwin-tags'
+      Type: String
+      Value: !Join
+        - ''
+        - - '['
+          - '{"key":"Environment","value":"'
+          - !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+          - '"}]'
+      Description: 'Tag configuration for FSx Windows file systems'
+
+  FSxNetAppTagsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/epic/monitoring/fsxnetapp-tags'
+      Type: String
+      Value: !Join
+        - ''
+        - - '['
+          - '{"key":"Environment","value":"'
+          - !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+          - '"}]'
+      Description: 'Tag configuration for FSx NetApp file systems'
+
   FoundationMemberStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: 'https://epic-monitoring-cfn-template.s3.amazonaws.com/foundation-member.yaml'
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.${AWS::Region}.amazonaws.com/${S3KeyPrefix}foundation-member.yaml'
       Parameters:
         Environment: !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
         ProjectName: !Ref ProjectName
@@ -45,32 +204,60 @@ Resources:
     Type: AWS::CloudFormation::Stack
     DependsOn: FoundationMemberStack
     Properties:
-      TemplateURL: 'https://epic-monitoring-cfn-template.s3.amazonaws.com/monitoring-iam.yaml'
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.${AWS::Region}.amazonaws.com/${S3KeyPrefix}monitoring-iam.yaml'
       Parameters:
         ProjectName: !Ref ProjectName
         Environment: !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
 
   MonitoringCoreStack:
     Type: AWS::CloudFormation::Stack
-    DependsOn: MonitoringIAMStack
+    DependsOn: 
+      - MonitoringIAMStack
+      - EC2TagsParameter
+      - EBSTagsParameter
+      - ALBTagsParameter
+      - NLBTagsParameter
+      - VPNTagsParameter
+      - DXTagsParameter
+      - TGWTagsParameter
+      - WAFTagsParameter
+      - NFWTagsParameter
+      - RDSTagsParameter
+      - FSxWinTagsParameter
+      - FSxNetAppTagsParameter
     Properties:
-      TemplateURL: 'https://epic-monitoring-cfn-template.s3.amazonaws.com/monitoring-core.yaml'
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.${AWS::Region}.amazonaws.com/${S3KeyPrefix}monitoring-core.yaml'
       Parameters:
         ProjectName: !Ref ProjectName
         Environment: !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
-        MonitoringRoleArn: !GetAtt MonitoringIAMStack.Outputs.MonitoringRoleArn
-        ResourceTagKey: !Ref ResourceTagKey
-        ResourceTagValue: !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'ResourceTagValue']
+        EC2TagPairs: !GetAtt EC2TagsParameter.Value
+        EBSTagPairs: !GetAtt EBSTagsParameter.Value
+        ALBTagPairs: !GetAtt ALBTagsParameter.Value
+        NLBTagPairs: !GetAtt NLBTagsParameter.Value
+        VPNTagPairs: !GetAtt VPNTagsParameter.Value
+        DXTagPairs: !GetAtt DXTagsParameter.Value
+        TGWTagPairs: !GetAtt TGWTagsParameter.Value
+        WAFTagPairs: !GetAtt WAFTagsParameter.Value
+        NFWTagPairs: !GetAtt NFWTagsParameter.Value
+        RDSTagPairs: !GetAtt RDSTagsParameter.Value
+        FSxWinTagPairs: !GetAtt FSxWinTagsParameter.Value
+        FSxNetAppTagPairs: !GetAtt FSxNetAppTagsParameter.Value
 
 Outputs:
   SNSTopicArn:
     Description: 'ARN of the SNS Topic'
     Value: !GetAtt FoundationMemberStack.Outputs.SNSTopicArn
+    Export:
+      Name: !Sub '${ProjectName}-SNSTopic-${AWS::AccountId}'
   
   MonitoringFunctionArn:
     Description: 'ARN of the Monitoring Lambda Function'
     Value: !GetAtt MonitoringCoreStack.Outputs.MonitoringFunctionArn
+    Export:
+      Name: !Sub '${ProjectName}-MonitoringFunction-${AWS::AccountId}'
   
   MonitoringRoleArn:
     Description: 'ARN of the Monitoring Role'
     Value: !GetAtt MonitoringIAMStack.Outputs.MonitoringRoleArn
+    Export:
+      Name: !Sub '${ProjectName}-MonitoringRole-${AWS::AccountId}'
