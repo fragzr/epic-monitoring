@@ -21,7 +21,7 @@ Resources:
   MonitoringLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub 'Epic-Mon-${Environment}-${AWS::AccountId}'  # Simplified name
+      RoleName: !Sub 'Epic-Mon-${Environment}-${AWS::AccountId}'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -38,11 +38,60 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  - 'cloudwatch:*'
-                  - 'ec2:Describe*'
-                  - 'sns:*'
-                  - 'logs:*'
+                  # CloudWatch Permissions
+                  - 'cloudwatch:PutMetricAlarm'
+                  - 'cloudwatch:DeleteAlarms'
+                  - 'cloudwatch:DescribeAlarms'
+                  - 'cloudwatch:GetMetricStatistics'
+                  
+                  # EC2 Related Permissions
+                  - 'ec2:DescribeInstances'
+                  - 'ec2:DescribeVolumes'
+                  - 'ec2:DescribeVpnConnections'
+                  - 'ec2:DescribeTransitGateways'
+                  
+                  # Load Balancer Permissions
+                  - 'elasticloadbalancing:DescribeLoadBalancers'
+                  - 'elasticloadbalancing:DescribeTargetGroups'
+                  - 'elasticloadbalancing:DescribeTargetHealth'
+                  
+                  # RDS Permissions
+                  - 'rds:DescribeDBInstances'
+                  - 'rds:DescribeDBClusters'
+                  
+                  # Direct Connect Permissions
+                  - 'directconnect:DescribeConnections'
+                  
+                  # WAF Permissions
+                  - 'wafv2:ListWebACLs'
+                  - 'wafv2:GetWebACL'
+                  
+                  # Network Firewall Permissions
+                  - 'network-firewall:ListFirewalls'
+                  - 'network-firewall:DescribeFirewall'
+                  
+                  # FSx Permissions
+                  - 'fsx:DescribeFileSystems'
+                  
+                  # SNS Permissions
+                  - 'sns:Publish'
+                  - 'sns:ListTopics'
+                  
+                  # CloudWatch Logs Permissions
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  
+                  # Additional Permissions for Enhanced Monitoring
+                  - 'cloudwatch:GetMetricData'
+                  - 'cloudwatch:ListMetrics'
                 Resource: '*'
+              
+              # Optional: You can restrict resources by adding specific ARNs
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-Monitoring-${Environment}'
 
 Outputs:
   MonitoringRoleArn:
