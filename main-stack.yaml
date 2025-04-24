@@ -191,18 +191,8 @@ Resources:
           - '"}]'
       Description: 'Tag configuration for FSx NetApp file systems'
 
-  FoundationMemberStack:
-    Type: AWS::CloudFormation::Stack
-    Properties:
-      TemplateURL: !Sub 'https://${S3BucketName}.s3.${AWS::Region}.amazonaws.com/${S3KeyPrefix}foundation-member.yaml'
-      Parameters:
-        Environment: !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
-        ProjectName: !Ref ProjectName
-        NotificationEmail: !Ref NotificationEmail
-
   MonitoringIAMStack:
     Type: AWS::CloudFormation::Stack
-    DependsOn: FoundationMemberStack
     Properties:
       TemplateURL: !Sub 'https://${S3BucketName}.s3.${AWS::Region}.amazonaws.com/${S3KeyPrefix}monitoring-iam.yaml'
       Parameters:
@@ -230,6 +220,7 @@ Resources:
       Parameters:
         ProjectName: !Ref ProjectName
         Environment: !FindInMap [AccountEnvironment, !Ref 'AWS::AccountId', 'Environment']
+        NotificationEmail: !Ref NotificationEmail 
         EC2TagPairs: !GetAtt EC2TagsParameter.Value
         EBSTagPairs: !GetAtt EBSTagsParameter.Value
         ALBTagPairs: !GetAtt ALBTagsParameter.Value
@@ -246,7 +237,7 @@ Resources:
 Outputs:
   SNSTopicArn:
     Description: 'ARN of the SNS Topic'
-    Value: !GetAtt FoundationMemberStack.Outputs.SNSTopicArn
+    Value: !GetAtt MonitoringCoreStack.Outputs.SNSTopicArn
     Export:
       Name: !Sub '${ProjectName}-SNSTopic-${AWS::AccountId}'
   
