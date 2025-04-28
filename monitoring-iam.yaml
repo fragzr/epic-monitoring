@@ -37,35 +37,50 @@ Resources:
                   - 'cloudwatch:DeleteAlarms'
                   - 'cloudwatch:DescribeAlarms'
                   - 'cloudwatch:GetMetricStatistics'
+                  - 'cloudwatch:GetMetricData'
+                  - 'cloudwatch:ListMetrics'
+                  
+                  # CloudWatch Dashboard Permissions
+                  - 'cloudwatch:PutDashboard'
+                  - 'cloudwatch:DeleteDashboards'
+                  - 'cloudwatch:GetDashboard'
+                  - 'cloudwatch:ListDashboards'
                   
                   # EC2 Related Permissions
                   - 'ec2:DescribeInstances'
                   - 'ec2:DescribeVolumes'
                   - 'ec2:DescribeVpnConnections'
                   - 'ec2:DescribeTransitGateways'
+                  - 'ec2:DescribeTags'
                   
                   # Load Balancer Permissions
                   - 'elasticloadbalancing:DescribeLoadBalancers'
                   - 'elasticloadbalancing:DescribeTargetGroups'
                   - 'elasticloadbalancing:DescribeTargetHealth'
+                  - 'elasticloadbalancing:DescribeTags'
                   
                   # RDS Permissions
                   - 'rds:DescribeDBInstances'
                   - 'rds:DescribeDBClusters'
+                  - 'rds:ListTagsForResource'
                   
                   # Direct Connect Permissions
                   - 'directconnect:DescribeConnections'
+                  - 'directconnect:DescribeTags'
                   
                   # WAF Permissions
                   - 'wafv2:ListWebACLs'
                   - 'wafv2:GetWebACL'
+                  - 'wafv2:ListTagsForResource'
                   
                   # Network Firewall Permissions
                   - 'network-firewall:ListFirewalls'
                   - 'network-firewall:DescribeFirewall'
+                  - 'network-firewall:ListTagsForResource'
                   
                   # FSx Permissions
                   - 'fsx:DescribeFileSystems'
+                  - 'fsx:ListTagsForResource'
                   
                   # SNS Permissions
                   - 'sns:Publish'
@@ -76,16 +91,41 @@ Resources:
                   - 'logs:CreateLogStream'
                   - 'logs:PutLogEvents'
                   
-                  # Additional Permissions for Enhanced Monitoring
-                  - 'cloudwatch:GetMetricData'
-                  - 'cloudwatch:ListMetrics'
+                  # SSM Parameter Store Permissions
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                  - 'ssm:DescribeParameters'
+
+                  # EventBridge Permissions
+                  - 'events:PutRule'
+                  - 'events:PutTargets'
+                  - 'events:DeleteRule'
+                  - 'events:RemoveTargets'
+                  - 'events:DescribeRule'
+                  - 'events:ListTargetsByRule'
+                  
+                  # CloudTrail Permissions
+                  - 'cloudtrail:LookupEvents'
+                  - 'cloudtrail:GetEventSelectors'
+                  
+                  # IAM Permissions for EventBridge role assumption
+                  - 'iam:PassRole'
                 Resource: '*'
               
-              # Optional: You can restrict resources by adding specific ARNs
+              # Specific SNS topic permission
               - Effect: Allow
                 Action:
                   - 'sns:Publish'
                 Resource: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-Monitoring-${Environment}'
+              
+              # Specific EventBridge rule permission
+              - Effect: Allow
+                Action:
+                  - 'events:PutRule'
+                  - 'events:PutTargets'
+                  - 'events:DeleteRule'
+                  - 'events:RemoveTargets'
+                Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/EBSDetachment-*'
       Tags:
         - Key: Name
           Value: !Sub 'Epic-Mon-${Environment}-${AWS::AccountId}'

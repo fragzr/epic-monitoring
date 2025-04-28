@@ -239,7 +239,7 @@ Resources:
           import boto3
           import os
           import json
-          from datetime import datetime, timezone
+          from datetime import datetime, timezone, timedelta
 
           def should_discover_all_resources(tag_pairs_json):
               """
@@ -446,8 +446,8 @@ Resources:
               print(f"\nEBS tag configuration: {tag_pairs_json}")
               tag_pairs = parse_tag_pairs(tag_pairs_json)
               
-              # Basic filters
-              filters = [{'Name': 'status', 'Values': ['in-use']}]
+              # Basic filters - include both 'in-use' and 'available' volumes
+              filters = []  # Remove the status filter to get all volumes
               
               volumes = []
               paginator = ec2_client.get_paginator('describe_volumes')
@@ -458,17 +458,20 @@ Resources:
                       filters.extend(tag_filters)
                       print(f"Filtering EBS volumes with: {filters}")
                   else:
-                      print("No tag filters - discovering all in-use EBS volumes")
+                      print("No tag filters - discovering all EBS volumes")
                       
                   for page in paginator.paginate(Filters=filters):
                       for volume in page['Volumes']:
-                          print(f"Checking volume {volume['VolumeId']}:")
-                          print(f"Volume tags: {volume.get('Tags', [])}")
+                          print(f"Found volume {volume['VolumeId']}:")
+                          print(f"  State: {volume.get('State')}")
+                          print(f"  Volume type: {volume.get('VolumeType')}")
+                          print(f"  Tags: {volume.get('Tags', [])}")
+                          
                           if tag_pairs is None or tags_match_all_criteria(volume.get('Tags', []), tag_pairs):
-                              print(f"Volume {volume['VolumeId']} matches criteria")
+                              print(f"✓ Volume {volume['VolumeId']} matches criteria")
                               volumes.append(volume)
                           else:
-                              print(f"Volume {volume['VolumeId']} does not match criteria")
+                              print(f"✗ Volume {volume['VolumeId']} does not match criteria")
                               
                   print(f"Total EBS volumes found: {len(volumes)}")
                   return volumes
@@ -583,7 +586,7 @@ Resources:
               except Exception as e:
                   print(f"Error in get_direct_connect_connections: {str(e)}")
                   raise
-          
+
           def get_transit_gateways(ec2_client, tag_pairs_json):
               """
               Get Transit Gateways based on tag pairs
@@ -690,7 +693,7 @@ Resources:
               except Exception as e:
                   print(f"Error in get_network_firewalls: {str(e)}")
                   raise
-          
+
           def get_rds_instances(rds_client, tag_pairs_json):
               """
               Get RDS instances based on tag pairs
@@ -759,9 +762,6 @@ Resources:
                   raise
 
           def create_ec2_alarms(instance_id, cloudwatch, sns_topic):
-              """
-              Create EC2 instance alarms
-              """
               # CPU Utilization
               create_alarm(cloudwatch, {
                   'AlarmName': f'Epic-EC2-CPUUtilization-{instance_id}',
@@ -826,75 +826,216 @@ Resources:
                   'Unit': 'Count'
               })
 
-          def create_ebs_alarms(volume_id, volume_type, cloudwatch, sns_topic):
-              """
-              Create EBS volume alarms
-              """
-              # Space Utilization
+              # EBS Status Check
               create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-EBS-SpaceUtilization-{volume_id}',
-                  'MetricName': 'VolumeUsedPercent',
-                  'Namespace': 'AWS/EBS',
-                  'Statistic': 'Average',
-                  'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}],
+                  'AlarmName': f'Epic-EC2-EBSStatusCheck-{instance_id}',
+                  'MetricName': 'StatusCheckFailed_AttachedEBS',
+                  'Namespace': 'AWS/EC2',
+                  'Statistic': 'Maximum',
+                  'Dimensions': [{'Name': 'InstanceId', 'Value': instance_id}],
                   'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': get_environment_threshold(75, 80, 80, 85, 85),
+                  'EvaluationPeriods': 1,
+                  'Threshold': 0,
                   'ComparisonOperator': 'GreaterThanThreshold',
                   'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'missing',
-                  'Unit': 'Percent'
-              })
-
-              # IOPS
-              iops_threshold = 10000 if volume_type == 'io2' else 3000
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-EBS-IOPS-{volume_id}',
-                  'MetricName': 'VolumeReadOps',
-                  'Namespace': 'AWS/EBS',
-                  'Statistic': 'Sum',
-                  'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': iops_threshold,
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
-                  'Unit': 'Count/Second'
-              })
-
-              # Queue Length
-              create_alarm(cloudwatch, {
-                  'AlarmName': f'Epic-EBS-QueueLength-{volume_id}',
-                  'MetricName': 'VolumeQueueLength',
-                  'Namespace': 'AWS/EBS',
-                  'Statistic': 'Average',
-                  'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}],
-                  'Period': 300,
-                  'EvaluationPeriods': 2,
-                  'Threshold': 1,
-                  'ComparisonOperator': 'GreaterThanThreshold',
-                  'AlarmActions': [sns_topic],
-                  'TreatMissingData': 'ignore',
+                  'AlarmDescription': f"EBS volume status check failed for instance {instance_id}",
+                  'TreatMissingData': 'breaching',
                   'Unit': 'Count'
               })
 
-              # Burst Balance (for gp2/gp3)
-              if volume_type in ['gp2', 'gp3']:
+
+
+          def get_attached_volumes(ec2_client):
+              """
+              Get all volumes that are currently attached to EC2 instances
+              """
+              try:
+                  volumes = []
+                  paginator = ec2_client.get_paginator('describe_volumes')
+                  
+                  # Filter for only attached volumes
+                  filters = [{'Name': 'attachment.status', 'Values': ['attached']}]
+                  
+                  for page in paginator.paginate(Filters=filters):
+                      for volume in page['Volumes']:
+                          # Get the instance ID this volume is attached to
+                          instance_id = volume['Attachments'][0]['InstanceId'] if volume['Attachments'] else None
+                          if instance_id:
+                              volumes.append({
+                                  'VolumeId': volume['VolumeId'],
+                                  'VolumeType': volume['VolumeType'],
+                                  'InstanceId': instance_id,
+                                  'Tags': volume.get('Tags', [])
+                              })
+                              print(f"Found attached volume {volume['VolumeId']} on instance {instance_id}")
+                  
+                  return volumes
+              except Exception as e:
+                  print(f"Error getting attached volumes: {str(e)}")
+                  raise
+
+          def check_recent_volume_detachments(cloudtrail, volume_id):
+              """
+              Check for detachment events in the last 90 days for a specific volume
+              """
+              try:
+                  # Calculate time range (90 days ago to now)
+                  end_time = datetime.now(timezone.utc)
+                  start_time = end_time - timedelta(days=90)
+                  
+                  response = cloudtrail.lookup_events(
+                      LookupAttributes=[
+                          {
+                              'AttributeKey': 'EventName',
+                              'AttributeValue': 'DetachVolume'
+                          }
+                      ],
+                      StartTime=start_time,
+                      EndTime=end_time
+                  )
+                  
+                  # Filter events for specific volume ID
+                  detachment_events = []
+                  for event in response.get('Events', []):
+                      cloud_trail_event = json.loads(event['CloudTrailEvent'])
+                      if cloud_trail_event.get('requestParameters', {}).get('volumeId') == volume_id:
+                          detachment_events.append({
+                              'eventTime': event['EventTime'],
+                              'username': event['Username'],
+                              'eventId': event['EventId']
+                          })
+                  
+                  return detachment_events
+                  
+              except Exception as e:
+                  print(f"Error checking volume detachment history for {volume_id}: {str(e)}")
+                  return []
+
+
+          def create_ebs_alarms(volume_id, volume_type, cloudwatch, sns_topic, events_client):
+              """
+              Create EBS volume alarms including detachment monitoring using EventBridge
+              """
+              try:
+                  print(f"Creating alarms and event rules for volume {volume_id}")
+                  
+                  # Create EventBridge rule for volume detachment
+                  rule_name = f'EBSDetachment-{volume_id}'
+                  
+                  # Create the EventBridge rule
+                  events_client.put_rule(
+                      Name=rule_name,
+                      EventPattern=json.dumps({
+                          "source": ["aws.ec2"],
+                          "detail-type": ["AWS API Call via CloudTrail"],
+                          "detail": {
+                              "eventSource": ["ec2.amazonaws.com"],
+                              "eventName": ["DetachVolume"],
+                              "requestParameters": {
+                                  "volumeId": [volume_id]
+                              }
+                          }
+                      }),
+                      State='ENABLED',
+                      Description=f'Monitor detachment events for EBS volume {volume_id}'
+                  )
+
+                  # Add target to the rule (SNS topic)
+                  events_client.put_targets(
+                      Rule=rule_name,
+                      Targets=[
+                          {
+                              'Id': f'DetachmentNotification-{volume_id}',
+                              'Arn': sns_topic,
+                              'Input': json.dumps({
+                                  'default': json.dumps({
+                                      'title': f'EBS Volume Detachment Alert',
+                                      'volume_id': volume_id,
+                                      'detail': 'Volume has been detached'
+                                  })
+                              })
+                          }
+                      ]
+                  )
+
+                  # Create alarm based on EventBridge MatchedEvents metric
                   create_alarm(cloudwatch, {
-                      'AlarmName': f'Epic-EBS-BurstBalance-{volume_id}',
-                      'MetricName': 'BurstBalance',
-                      'Namespace': 'AWS/EBS',
+                      'AlarmName': f'Epic-EBS-Detachment-{volume_id}',
+                      'MetricName': 'MatchedEvents',
+                      'Namespace': 'AWS/Events',
+                      'Statistic': 'Sum',
+                      'Dimensions': [
+                          {
+                              'Name': 'RuleName',
+                              'Value': rule_name
+                          }
+                      ],
+                      'Period': 60,
+                      'EvaluationPeriods': 1,
+                      'Threshold': 0,
+                      'ComparisonOperator': 'GreaterThanThreshold',
+                      'AlarmActions': [sns_topic],
+                      'AlarmDescription': f"Alert on volume detachment events for {volume_id}",
+                      'TreatMissingData': 'notBreaching'
+                  })
+
+                  print(f"Created EventBridge rule and alarm for volume {volume_id}")
+
+                  # Space Utilization using LogicalDisk % Free Space
+                  create_alarm(cloudwatch, {
+                      'AlarmName': f'Epic-EBS-SpaceUtilization-{volume_id}',
+                      'MetricName': 'LogicalDisk % Free Space',
+                      'Namespace': 'CWAgent',
                       'Statistic': 'Average',
                       'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}],
                       'Period': 300,
                       'EvaluationPeriods': 2,
-                      'Threshold': 20,
+                      'Threshold': get_environment_threshold(20, 15, 15, 10, 10),
                       'ComparisonOperator': 'LessThanThreshold',
                       'AlarmActions': [sns_topic],
                       'TreatMissingData': 'missing',
                       'Unit': 'Percent'
                   })
+
+                  # Total IOPS (Read + Write)
+                  iops_threshold = 10000 if volume_type == 'io2' else 3000
+                  create_alarm(cloudwatch, {
+                      'AlarmName': f'Epic-EBS-TotalIOPS-{volume_id}',
+                      'MetricName': 'VolumeReadOps + VolumeWriteOps',
+                      'Namespace': 'AWS/EBS',
+                      'Statistic': 'Sum',
+                      'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}],
+                      'Period': 300,
+                      'EvaluationPeriods': 2,
+                      'Threshold': iops_threshold,
+                      'ComparisonOperator': 'GreaterThanThreshold',
+                      'AlarmActions': [sns_topic],
+                      'TreatMissingData': 'ignore',
+                      'Unit': 'Count/Second'
+                  })
+
+                  # Queue Length
+                  create_alarm(cloudwatch, {
+                      'AlarmName': f'Epic-EBS-QueueLength-{volume_id}',
+                      'MetricName': 'VolumeQueueLength',
+                      'Namespace': 'AWS/EBS',
+                      'Statistic': 'Average',
+                      'Dimensions': [{'Name': 'VolumeId', 'Value': volume_id}],
+                      'Period': 300,
+                      'EvaluationPeriods': 2,
+                      'Threshold': 1,
+                      'ComparisonOperator': 'GreaterThanThreshold',
+                      'AlarmActions': [sns_topic],
+                      'TreatMissingData': 'ignore',
+                      'Unit': 'Count'
+                  })
+
+                  return True
+
+              except Exception as e:
+                  print(f"Error creating alarms for volume {volume_id}: {str(e)}")
+                  return False
+
 
           def create_alb_alarms(alb_arn, cloudwatch, sns_topic):
               """
@@ -1311,9 +1452,6 @@ Resources:
                   return '[{"key":"Environment","value":""}]'  # default fallback
 
           def lambda_handler(event, context):
-              """
-              Main Lambda function handler
-              """
               try:
                   print("Starting Epic Monitoring Lambda function...")
                   
@@ -1326,9 +1464,12 @@ Resources:
                   wafv2 = boto3.client('wafv2')
                   networkfirewall = boto3.client('network-firewall')
                   fsx = boto3.client('fsx')
-                  
+                  cloudtrail = boto3.client('cloudtrail')
+                  events = boto3.client('events')  # Add EventBridge client
+                
                   sns_topic = os.environ['SNS_TOPIC']
-                  
+
+                  # Initialize processed resources counter
                   processed_resources = {
                       'ec2': 0,
                       'ebs': 0,
@@ -1344,6 +1485,29 @@ Resources:
                       'fsx_netapp': 0
                   }
 
+                  # Process EBS Volumes
+                  print("\nProcessing EBS volumes...")
+                  try:
+                      ebs_tag_pairs = get_tag_configuration('ebs')
+                      volumes = get_ebs_volumes(ec2, ebs_tag_pairs)
+                      print(f"Total EBS volumes found: {len(volumes)}")
+                      
+                      for volume in volumes:
+                          if create_ebs_alarms(
+                              volume_id=volume['VolumeId'],
+                              volume_type=volume['VolumeType'],
+                              cloudwatch=cloudwatch,
+                              sns_topic=sns_topic,
+                              events_client=events
+                          ):
+                              processed_resources['ebs'] += 1
+                              print(f"Successfully created alarms for volume {volume['VolumeId']}")
+                              
+                      print(f"Successfully processed {processed_resources['ebs']} out of {len(volumes)} volumes")
+                      
+                  except Exception as e:
+                      print(f"Error processing EBS volumes: {str(e)}")
+
                   # Process EC2 Instances
                   print("\nProcessing EC2 instances...")
                   try:
@@ -1355,16 +1519,6 @@ Resources:
                   except Exception as e:
                       print(f"Error processing EC2 instances: {str(e)}")
 
-                  # Process EBS Volumes
-                  print("\nProcessing EBS volumes...")
-                  try:
-                      ebs_tag_pairs = get_tag_configuration('ebs')
-                      volumes = get_ebs_volumes(ec2, ebs_tag_pairs)
-                      for volume in volumes:
-                          create_ebs_alarms(volume['VolumeId'], volume['VolumeType'], cloudwatch, sns_topic)
-                          processed_resources['ebs'] += 1
-                  except Exception as e:
-                      print(f"Error processing EBS volumes: {str(e)}")
 
                   # Process Application Load Balancers
                   print("\nProcessing Application Load Balancers...")
@@ -1497,6 +1651,8 @@ Resources:
                   print(f"Error in lambda_handler: {str(e)}")
                   raise
 
+
+
       Runtime: python3.9
       Timeout: 900
       MemorySize: 512
@@ -1531,7 +1687,11 @@ Resources:
                   - 'cloudwatch:DescribeAlarms'
                   - 'cloudwatch:GetMetricStatistics'
                   - 'cloudwatch:GetMetricData'
-                  - 'cloudwatch:ListMetrics'
+                  - 'cloudwatch:ListMetrics'    
+                  - 'logs:PutMetricFilter'
+                  - 'logs:DeleteMetricFilter'
+                  - 'logs:DescribeMetricFilters'
+                  - 'cloudtrail:LookupEvents'
                   
                   # EC2 Related Permissions
                   - 'ec2:DescribeInstances'
@@ -1580,6 +1740,10 @@ Resources:
                   - 'ssm:GetParameter'
                   - 'ssm:GetParameters'
                   - 'ssm:DescribeParameters'
+
+                  # Cloudtrail look up permission
+                  - 'cloudtrail:LookupEvents'
+
                 Resource: '*'
 
               - Effect: Allow
